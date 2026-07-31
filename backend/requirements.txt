@@ -31,3 +31,6 @@ aiohttp==3.11.10
 python-dotenv==1.0.1
 python-multipart==0.0.18
 sse-starlette==2.1.3
+
+# JWT Auth
+PyJWT==2.9.0

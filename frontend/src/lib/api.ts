@@ -2,6 +2,162 @@
 // 生产环境可经 Nginx 等同源反向代理，同样无需跨域。
 const BASE_URL = ''
 
+// ── Auth Token 管理 ──
+const TOKEN_KEY = 'pharma_auth_token'
+export function getStoredToken(): string | null {
+  return localStorage.getItem(TOKEN_KEY)
+}
+export function setStoredToken(token: string): void {
+  localStorage.setItem(TOKEN_KEY, token)
+}
+export function clearStoredToken(): void {
+  localStorage.removeItem(TOKEN_KEY)
+}
+
+// 带 token 的通用 fetch
+async function authFetch(url: string, options: RequestInit = {}): Promise<Response> {
+  const token = getStoredToken()
+  const headers: Record<string, string> = {
+    ...(options.headers as Record<string, string> || {}),
+  }
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`
+  }
+  return fetch(url, { ...options, headers })
+}
+
+// ── 原辅料速查（独立端点，不走 agent 规划）──
+export interface LookupField {
+  key: string
+  label: string
+  value: string
+  source: string
+  sourceUrl: string
+  confidence: number
+}
+
+export interface LookupModule {
+  fields: LookupField[]
+  text_parts: string[]
+  text_parts_cn: string[]
+}
+
+export interface ExcipientLookupCitation {
+  source_name: string
+  source_url: string
+  snippet: string
+}
+
+export interface ExcipientLookupEntity {
+  drug_name_cn?: string
+  drug_name_en?: string
+  excipient_name_cn?: string
+  excipient_name_en?: string
+  cas_number?: string
+  product_type?: string
+  unii_code?: string
+  // 向后兼容
+  query?: string
+  canonical?: string
+  cas?: string
+}
+
+export interface ExcipientLookupResult {
+  ok: boolean
+  content: string
+  citations: ExcipientLookupCitation[]
+  entity: ExcipientLookupEntity | null
+  modules: Record<string, LookupModule>
+}
+
+export async function lookupExcipient(name: string): Promise<ExcipientLookupResult> {
+  const res = await authFetch(`${BASE_URL}/api/excipient/lookup`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  })
+  if (!res.ok) {
+    if (res.status === 401) throw new Error('AUTH_REQUIRED')
+    const text = await res.text().catch(() => '')
+    throw new Error(text || `速查失败 (${res.status})`)
+  }
+  return res.json()
+}
+
+// ── 认证 ──
+export interface LoginResult {
+  ok: boolean
+  token: string
+  username: string
+  message: string
+}
+
+export async function login(username: string, password: string): Promise<LoginResult> {
+  const res = await fetch(`${BASE_URL}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  })
+  return res.json()
+}
+
+export async function checkAuth(): Promise<boolean> {
+  try {
+    const res = await authFetch(`${BASE_URL}/api/auth/me`)
+    const data = await res.json()
+    return data.ok === true
+  } catch {
+    return false
+  }
+}
+
+// ── AI 问答会话历史 ──
+export interface BackendConversation {
+  id: string
+  title: string
+  thread_id: string
+  created_at: string
+  updated_at: string
+}
+
+export interface BackendConversationMessage {
+  role: 'user' | 'assistant'
+  content: string
+  thinking_steps?: string[]
+  references?: Array<{
+    source_name: string
+    source_url: string
+    snippet: string
+  }>
+  timestamp: string
+}
+
+export async function fetchConversations(): Promise<BackendConversation[]> {
+  const res = await authFetch(`${BASE_URL}/api/conversations`)
+  if (!res.ok) throw new Error(`获取会话列表失败: ${res.status}`)
+  return res.json()
+}
+
+export async function fetchConversationMessages(conversationId: string): Promise<BackendConversationMessage[]> {
+  const res = await authFetch(`${BASE_URL}/api/conversations/${conversationId}/messages`)
+  if (!res.ok) throw new Error(`获取消息失败: ${res.status}`)
+  const data = await res.json()
+  // 后端直接返回数组；若未来加了 messages 包裹层也兼容
+  return Array.isArray(data) ? data : (data.messages || [])
+}
+
+// ── 速查历史 ──
+export async function fetchLookupHistory(): Promise<any[]> {
+  const res = await authFetch(`${BASE_URL}/api/lookup/history`)
+  if (!res.ok) throw new Error('获取历史失败')
+  return res.json()
+}
+
+export async function deleteLookupHistory(id: string): Promise<void> {
+  const res = await authFetch(`${BASE_URL}/api/lookup/history/${id}`, { method: 'DELETE' })
+  if (!res.ok) throw new Error('删除失败')
+}
+
 // 后端 SSE 事件类型（main.py 真实推送）
 interface ThinkingEvent {
   type: 'thinking'
@@ -71,7 +227,7 @@ export async function sendChatMessage(
   activeController = controller
 
   try {
-    const res = await fetch(`${BASE_URL}/api/chat`, {
+    const res = await authFetch(`${BASE_URL}/api/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({

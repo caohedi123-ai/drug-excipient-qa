@@ -4,21 +4,55 @@ import json
 import re
 import uuid
 import traceback
+import hashlib
+from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 import asyncio
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
+import jwt as pyjwt
 
 from config import get_settings
 from db.database import get_db, AsyncSessionLocal, init_redis, close_redis, sync_engine
 from agent.graph import get_agent_graph
 from tools.sanitize import sanitize_query
 
+# 原辅料速查独立入口（条件导入，导入失败不影响其它接口）
+try:
+    from tools import excipient_basic_info_tool as _excipient_lookup_tool
+except Exception:
+    _excipient_lookup_tool = None
+
 settings = get_settings()
+
+# ── JWT 认证配置 ──
+JWT_SECRET = "pharma-knowledge-assistant-2024-secret-key"
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_HOURS = 24
+FIXED_USERNAME = "admin"
+FIXED_PASSWORD_HASH = hashlib.sha256("admin@2024".encode()).hexdigest()
+
+# ── 认证依赖 ──
+async def requires_auth(authorization: str = Header(None)):
+    """JWT Bearer Token 验证中间件依赖。"""
+    if not authorization:
+        raise HTTPException(status_code=401, detail="请先登录")
+    try:
+        scheme, token = authorization.split(" ", 1)
+        if scheme.lower() != "bearer":
+            raise HTTPException(status_code=401, detail="认证格式错误")
+        payload = pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return payload.get("sub")
+    except pyjwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="登录已过期，请重新登录")
+    except pyjwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="无效凭证，请重新登录")
+    except Exception:
+        raise HTTPException(status_code=401, detail="认证失败")
 
 
 def _split_answer(text: str, size: int = 60) -> list[str]:
@@ -54,6 +88,10 @@ class FeedbackCreate(BaseModel):
     rating: int
     category: str | None = None
     comment: str | None = None
+
+
+class ExcipientLookupRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=200, description="原辅料名称（中文名/英文名/商品名/CAS）")
 
 
 # === 应用生命周期 ===
@@ -107,6 +145,20 @@ async def lifespan(app: FastAPI):
             conn.execute(text("""
                 CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation_id);
             """))
+            # 速查历史表
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS lookup_history (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    name VARCHAR(500) NOT NULL,
+                    entity JSONB DEFAULT '{}'::jsonb,
+                    modules JSONB DEFAULT '{}'::jsonb,
+                    citations JSONB DEFAULT '[]'::jsonb,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """))
+            conn.execute(text("""
+                CREATE INDEX IF NOT EXISTS idx_lookup_history_created ON lookup_history(created_at DESC);
+            """))
             conn.commit()
     except Exception as e:
         print(f"[WARN] 数据库初始化（建表）失败，已跳过: {e}", flush=True)
@@ -140,7 +192,7 @@ app.add_middleware(
 
 # === Chat 端点 (SSE 流式) ===
 @app.post("/api/chat")
-async def chat(http_request: Request, req: ChatRequest):
+async def chat(http_request: Request, req: ChatRequest, user: str = Depends(requires_auth)):
     agent = get_agent_graph()
     query = sanitize_query(req.query, max_len=2000)  # 入口仅清洗控制字符/零宽，保留长问实体（截断由各源内部处理）
 
@@ -302,7 +354,7 @@ async def chat(http_request: Request, req: ChatRequest):
 
 # === 对话管理 ===
 @app.get("/api/conversations")
-async def list_conversations(db: AsyncSession = Depends(get_db)):
+async def list_conversations(user: str = Depends(requires_auth), db: AsyncSession = Depends(get_db)):
     result = await db.execute(text(
         "SELECT id, title, thread_id, created_at, updated_at FROM conversations ORDER BY updated_at DESC LIMIT 50"
     ))
@@ -314,7 +366,7 @@ async def list_conversations(db: AsyncSession = Depends(get_db)):
 
 
 @app.get("/api/conversations/{conversation_id}/messages")
-async def get_messages(conversation_id: str, db: AsyncSession = Depends(get_db)):
+async def get_messages(conversation_id: str, user: str = Depends(requires_auth), db: AsyncSession = Depends(get_db)):
     try:
         uuid.UUID(conversation_id)
     except (ValueError, AttributeError):
@@ -347,7 +399,7 @@ async def get_messages(conversation_id: str, db: AsyncSession = Depends(get_db))
 
 
 @app.delete("/api/conversations/{conversation_id}")
-async def delete_conversation(conversation_id: str, db: AsyncSession = Depends(get_db)):
+async def delete_conversation(conversation_id: str, user: str = Depends(requires_auth), db: AsyncSession = Depends(get_db)):
     await db.execute(text("DELETE FROM conversations WHERE id=:id"), {"id": conversation_id})
     await db.commit()
     return {"status": "ok"}
@@ -355,10 +407,140 @@ async def delete_conversation(conversation_id: str, db: AsyncSession = Depends(g
 
 # === 反馈 ===
 @app.post("/api/feedback")
-async def submit_feedback(req: FeedbackCreate, db: AsyncSession = Depends(get_db)):
+async def submit_feedback(req: FeedbackCreate, user: str = Depends(requires_auth), db: AsyncSession = Depends(get_db)):
     await db.execute(text(
         "INSERT INTO feedback (message_id, rating, category, comment) VALUES (:mid, :rating, :cat, :comment)"
     ), {"mid": req.message_id, "rating": req.rating, "cat": req.category, "comment": req.comment})
+    await db.commit()
+    return {"status": "ok"}
+
+
+# === 原辅料速查独立入口（绕过 agent 规划，直接调用速查工具）===
+def _parse_lookup_result(raw: str) -> dict:
+    """解析速查工具返回值（模块化格式：__MODULES_JSON__ + __CITATIONS__ + __ENTITY__）。"""
+    content = raw
+    modules = {}
+    citations: list = []
+    entity = None
+
+    # ── 解析 __MODULES_JSON__ ──
+    mm = re.search(r"__MODULES_JSON__\s*:\s*(\{[\s\S]*?\})\s*(?=__|$)", raw, re.DOTALL)
+    if mm:
+        try:
+            modules = json.loads(mm.group(1))
+        except Exception:
+            modules = {}
+        content = raw[:mm.start()].strip()
+
+    # ── 解析 __CITATIONS__ ──
+    mc = re.search(r"__CITATIONS__\s*:\s*(\[[\s\S]*?\])\s*(?=__|$)", raw, re.DOTALL)
+    if mc:
+        try:
+            citations = json.loads(mc.group(1))
+        except Exception:
+            citations = []
+        if not mm:  # 如果 __MODULES_JSON__ 没匹配到，从这里截断
+            content = raw[:mc.start()].strip()
+        content = re.sub(r"\s*__CITATIONS__\s*:.*", "", content, flags=re.DOTALL).strip()
+
+    # ── 解析 __ENTITY__ ──
+    me = re.search(r"__ENTITY__\s*:\s*(\{[\s\S]*?\})\s*$", raw, re.DOTALL)
+    if me:
+        try:
+            entity = json.loads(me.group(1))
+        except Exception:
+            entity = None
+
+    content = re.sub(r"^\[原辅料基本信息速查\]\s*", "", content).strip()
+    # 清理残留的 JSON 标记
+    content = re.sub(r"__MODULES_JSON__\s*:.*", "", content, flags=re.DOTALL).strip()
+    content = re.sub(r"__ENTITY__\s*:.*", "", content, flags=re.DOTALL).strip()
+
+    return {"content": content, "citations": citations, "entity": entity, "modules": modules}
+
+
+@app.post("/api/excipient/lookup")
+async def excipient_lookup(req: ExcipientLookupRequest, user: str = Depends(requires_auth), db: AsyncSession = Depends(get_db)):
+    """原辅料基本信息速查独立入口：输入名称直接返回速查结果，不走 agent 规划。"""
+    if _excipient_lookup_tool is None:
+        raise HTTPException(status_code=503, detail="速查工具未加载，请联系管理员")
+    try:
+        raw = await _excipient_lookup_tool.ainvoke(req.name)
+        result = _parse_lookup_result(raw)
+        # 自动保存速查历史到数据库
+        try:
+            history_uuid = uuid.uuid4()
+            await db.execute(text("""
+                INSERT INTO lookup_history (id, name, entity, modules, citations)
+                VALUES (:id, :name, CAST(:entity AS jsonb), CAST(:modules AS jsonb), CAST(:citations AS jsonb))
+            """), {
+                "id": history_uuid,
+                "name": req.name,
+                "entity": json.dumps(result.get("entity") or {}, ensure_ascii=False),
+                "modules": json.dumps(result.get("modules") or {}, ensure_ascii=False),
+                "citations": json.dumps(result.get("citations") or [], ensure_ascii=False),
+            })
+            await db.commit()
+            result["history_id"] = str(history_uuid)
+        except Exception:
+            await db.rollback()
+        return {"ok": True, **result}
+    except Exception as e:
+        return {"ok": False, "content": f"速查失败：{e}", "citations": [], "entity": None, "modules": {}}
+
+
+# === 认证 ===
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1)
+    password: str = Field(min_length=1)
+
+class LoginResponse(BaseModel):
+    ok: bool
+    token: str = ""
+    username: str = ""
+    message: str = ""
+
+@app.post("/api/auth/login")
+async def login(req: LoginRequest):
+    """固定账号登录：admin / admin@2024"""
+    if req.username != FIXED_USERNAME:
+        return {"ok": False, "token": "", "username": "", "message": "用户名错误"}
+    pwd_hash = hashlib.sha256(req.password.encode()).hexdigest()
+    if pwd_hash != FIXED_PASSWORD_HASH:
+        return {"ok": False, "token": "", "username": "", "message": "密码错误"}
+    payload = {
+        "sub": FIXED_USERNAME,
+        "iat": datetime.utcnow(),
+        "exp": datetime.utcnow() + timedelta(hours=JWT_EXPIRE_HOURS),
+    }
+    token = pyjwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return {"ok": True, "token": token, "username": FIXED_USERNAME, "message": "登录成功"}
+
+@app.get("/api/auth/me")
+async def me(user: str = Depends(requires_auth)):
+    return {"ok": True, "username": user}
+
+# === 速查历史 ===
+@app.get("/api/lookup/history")
+async def get_lookup_history(user: str = Depends(requires_auth), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(text(
+        "SELECT id, name, entity, modules, citations, created_at FROM lookup_history ORDER BY created_at DESC LIMIT 50"
+    ))
+    rows = result.fetchall()
+    return [
+        {
+            "id": str(r[0]), "name": r[1],
+            "entity": r[2] if isinstance(r[2], dict) else json.loads(r[2]) if r[2] else None,
+            "modules": r[3] if isinstance(r[3], dict) else {},
+            "citations": r[4] if isinstance(r[4], list) else json.loads(r[4] or "[]"),
+            "created_at": str(r[5]),
+        }
+        for r in rows
+    ]
+
+@app.delete("/api/lookup/history/{history_id}")
+async def delete_lookup_history(history_id: str, user: str = Depends(requires_auth), db: AsyncSession = Depends(get_db)):
+    await db.execute(text("DELETE FROM lookup_history WHERE id=:id"), {"id": history_id})
     await db.commit()
     return {"status": "ok"}
 

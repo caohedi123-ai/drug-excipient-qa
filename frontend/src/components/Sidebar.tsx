@@ -1,5 +1,5 @@
 import { type FC } from 'react'
-import type { Conversation } from '../types'
+import type { Conversation, LookupHistoryItem } from '../types'
 
 interface SidebarProps {
   conversations: Conversation[]
@@ -9,6 +9,8 @@ interface SidebarProps {
   onSelect: (id: string) => void
   onDelete: (id: string) => void
   onClose: () => void
+  lookupHistory: LookupHistoryItem[]
+  onSelectLookup: (id: string) => void
 }
 
 export const Sidebar: FC<SidebarProps> = ({
@@ -19,6 +21,8 @@ export const Sidebar: FC<SidebarProps> = ({
   onSelect,
   onDelete,
   onClose,
+  lookupHistory,
+  onSelectLookup,
 }) => {
   if (!open) return null
 
@@ -54,7 +58,7 @@ export const Sidebar: FC<SidebarProps> = ({
 
       {/* Conversation List */}
       <div className="flex-1 overflow-y-auto px-2 space-y-0.5">
-        {conversations.length === 0 && (
+        {conversations.length === 0 && lookupHistory.length === 0 && (
           <div className="text-xs text-[#484f58] text-center py-8">
             暂无记录
           </div>
@@ -86,6 +90,32 @@ export const Sidebar: FC<SidebarProps> = ({
             </div>
           )
         })}
+
+        {/* 速查历史分组 */}
+        {lookupHistory.length > 0 && (
+          <>
+            <div className="pt-3 pb-1 px-1">
+              <div className="text-[10px] font-semibold text-[#d29922] uppercase tracking-wider px-2 py-1">
+                速查历史
+              </div>
+            </div>
+            {lookupHistory.map(item => (
+              <div
+                key={item.id}
+                onClick={() => onSelectLookup(item.id)}
+                className="group flex items-center gap-2 px-3 py-1.5 rounded-md text-sm text-[#8b949e] hover:bg-[#1c2128] hover:text-[#e6edf3] cursor-pointer transition-colors duration-100"
+              >
+                <svg className="w-3.5 h-3.5 flex-shrink-0 text-[#d29922]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                </svg>
+                <span className="flex-1 truncate text-xs">{item.name}</span>
+                <span className="text-[10px] text-[#484f58]">
+                  {item.created_at ? new Date(item.created_at).toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' }) : ''}
+                </span>
+              </div>
+            ))}
+          </>
+        )}
       </div>
 
       {/* Footer */}

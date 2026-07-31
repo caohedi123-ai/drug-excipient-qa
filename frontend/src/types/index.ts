@@ -33,3 +33,13 @@ export interface Reference {
   sourceName?: string
   snippet?: string
 }
+
+// ── 速查历史 ──
+export interface LookupHistoryItem {
+  id: string
+  name: string
+  entity: Record<string, any> | null
+  modules: Record<string, any>
+  citations: Array<{ source_name: string; source_url: string; snippet: string }>
+  created_at: string
+}

@@ -36,3 +36,9 @@ Thumbs.db
 
 # ===== 误产生的垃圾文件 =====
 /$null
+
+# ===== 临时调试 / 测试脚本与产物（非源码）=====
+backend/_*.py
+backend/e2e_*.json
+backend/lookup_*.json
+backend/lookup_test.json

@@ -5,13 +5,13 @@ import { ChatInput } from './ChatInput'
 import { MessageBubble } from './MessageBubble'
 import { ThinkingProcess } from './ThinkingProcess'
 import { ReferenceList } from './ReferenceList'
-import { sendChatMessage, abortActiveRequest, isRequestActive } from '../lib/api'
+import DataSourcePanel from './DataSourcePanel'
+import { sendChatMessage, abortActiveRequest, isRequestActive, fetchConversationMessages } from '../lib/api'
 import type { Conversation, Message } from '../types'
 
 interface ChatContainerProps {
   conversation?: Conversation
   onUpdate: (conv: Conversation) => void
-  onToggleSidebar: () => void
 }
 
 interface ThinkingStep {
@@ -33,7 +33,6 @@ interface RefItem {
 export const ChatContainer: FC<ChatContainerProps> = ({
   conversation,
   onUpdate,
-  onToggleSidebar,
 }) => {
   const [messages, setMessages] = useState<Message[]>([])
   const [streamingContent, setStreamingContent] = useState('')
@@ -41,19 +40,113 @@ export const ChatContainer: FC<ChatContainerProps> = ({
   const [references, setReferences] = useState<RefItem[]>([])
   const [error, setError] = useState<string | null>(null)
   const [isStreaming, setIsStreaming] = useState(false)
+  const [loadingHistory, setLoadingHistory] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const lastConvIdRef = useRef<string | null>(null)
+  const skipAutoScrollRef = useRef(false)
 
-  // reset messages when conversation changes
+  // conversation ref —— 避免 handleSend 闭包过期
+  const conversationRef = useRef(conversation)
+  conversationRef.current = conversation
+
+  // Refs to avoid stale closures when saving state
+  const msgsRef = useRef(messages)
+  const streamRef = useRef(streamingContent)
+  const stepsRef = useRef(thinkingSteps)
+  const refsRef = useRef(references)
+  const errRef = useRef(error)
+  const streamingRef = useRef(isStreaming)
+  msgsRef.current = messages
+  streamRef.current = streamingContent
+  stepsRef.current = thinkingSteps
+  refsRef.current = references
+  errRef.current = error
+  streamingRef.current = isStreaming
+
+  // 跨会话状态持久化：切换对话时保存当前→恢复目标
+  const savedStatesRef = useRef<Map<string, {
+    messages: Message[]
+    streamingContent: string
+    thinkingSteps: ThinkingStep[]
+    references: RefItem[]
+    error: string | null
+    isStreaming: boolean
+  }>>(new Map())
+
   useEffect(() => {
-    setMessages([])
-    setStreamingContent('')
-    setThinkingSteps([])
-    setReferences([])
-    setError(null)
+    const newId = conversation?.id ?? null
+    const oldId = lastConvIdRef.current
+    if (oldId === newId) return  // 同一会话 prop 更新（如 thread_id 补齐），不重置
+
+    // 保存当前会话状态
+    if (oldId) {
+      savedStatesRef.current.set(oldId, {
+        messages: msgsRef.current,
+        streamingContent: streamRef.current,
+        thinkingSteps: stepsRef.current,
+        references: refsRef.current,
+        error: errRef.current,
+        isStreaming: streamingRef.current,
+      })
+    }
+
+    // 恢复/初始化目标会话状态
+    if (newId) {
+      const saved = savedStatesRef.current.get(newId)
+      if (saved) {
+        // 已缓存在内存中（本次会话中切换过的），直接恢复
+        setMessages(saved.messages)
+        setStreamingContent(saved.streamingContent)
+        setThinkingSteps(saved.thinkingSteps)
+        setReferences(saved.references)
+        setError(saved.error)
+        setIsStreaming(saved.isStreaming)
+      } else {
+        // 未缓存 —— 从后端加载历史消息
+        setMessages([])
+        setStreamingContent('')
+        setThinkingSteps([])
+        setReferences([])
+        setError(null)
+        setIsStreaming(false)
+        setLoadingHistory(true)
+        fetchConversationMessages(newId)
+          .then(backendMsgs => {
+            if (backendMsgs && backendMsgs.length > 0) {
+              const loaded: Message[] = backendMsgs.map((m: any) => ({
+                id: m.id || crypto.randomUUID(),
+                role: m.role as 'user' | 'assistant',
+                content: m.content || '',
+                timestamp: m.timestamp || m.created_at || new Date().toISOString(),
+              }))
+              skipAutoScrollRef.current = true  // 加载历史不自动滚到底部
+              setMessages(loaded)
+              // 缓存到 savedStatesRef，避免重复加载
+              savedStatesRef.current.set(newId, {
+                messages: loaded,
+                streamingContent: '',
+                thinkingSteps: [],
+                references: [],
+                error: null,
+                isStreaming: false,
+              })
+            }
+          })
+          .catch(err => console.warn('加载会话消息失败:', err))
+          .finally(() => setLoadingHistory(false))
+      }
+    }
+
+    lastConvIdRef.current = newId
   }, [conversation?.id])
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    // 跳过历史加载时的自动滚动，仅流式输出时自动滚到底部
+    if (skipAutoScrollRef.current) {
+      skipAutoScrollRef.current = false
+      return
+    }
+    try { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }) } catch {}
   }, [streamingContent, messages.length, thinkingSteps.length, references.length])
 
   const handleSend = useCallback((question: string) => {
@@ -77,12 +170,13 @@ export const ChatContainer: FC<ChatContainerProps> = ({
     setMessages(prev => [...prev, userMsg])
 
     // 确保有稳定的 thread_id，保证后端会话连续性（修复 thread_id 缺失导致每次新建会话）
-    let threadId = conversation?.thread_id ?? null
-    if (!conversation || !conversation.thread_id) {
+    const conv = conversationRef.current
+    let threadId = conv?.thread_id ?? null
+    if (!conv || !conv.thread_id) {
       const newThreadId = crypto.randomUUID()
       threadId = newThreadId
-      const conv: Conversation = conversation
-        ? { ...conversation, thread_id: newThreadId }
+      const newConv: Conversation = conv
+        ? { ...conv, thread_id: newThreadId }
         : {
             id: crypto.randomUUID(),
             title: question.slice(0, 30),
@@ -90,7 +184,7 @@ export const ChatContainer: FC<ChatContainerProps> = ({
             created_at: ts,
             updated_at: ts,
           }
-      onUpdate(conv)
+      onUpdate(newConv)
     }
     setIsStreaming(true)
 
@@ -160,7 +254,7 @@ export const ChatContainer: FC<ChatContainerProps> = ({
         setIsStreaming(false)
       },
     })
-  }, [conversation, onUpdate])
+  }, [onUpdate])   // conversation 通过 conversationRef 读取，不依赖 props
 
   const handleStop = useCallback(() => {
     abortActiveRequest()
@@ -183,40 +277,27 @@ export const ChatContainer: FC<ChatContainerProps> = ({
   const hasStream = streamingContent.length > 0
 
   return (
-    <div className="flex-1 flex flex-col h-full min-w-0">
-      {/* Header */}
-      <div className="flex items-center gap-2 px-4 h-10 border-b border-[#21262d] bg-[#0d1117]">
-        <button
-          onClick={onToggleSidebar}
-          className="p-1 rounded-md text-[#8b949e] hover:text-[#e6edf3] hover:bg-[#1c2128] transition-colors duration-100"
-          title="切换侧边栏"
-        >
-          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M4 6h16M4 12h16M4 18h16" />
-          </svg>
-        </button>
-        <div className="flex-1 flex items-center gap-2 min-w-0">
-          <svg className="w-4 h-4 text-[#58a6ff] flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
-          </svg>
-          <span className="text-sm font-medium text-[#e6edf3] truncate">
-            中诺药物原辅料知识问答
-          </span>
-          <span className="text-[10px] text-[#484f58] uppercase tracking-wider border border-[#21262d] rounded px-1.5">Beta</span>
-        </div>
-        {isStreaming && (
-          <button onClick={handleStop} className="btn-danger">
-            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <rect x="6" y="6" width="12" height="12" rx="1" fill="currentColor"/>
-            </svg>
-            停止
-          </button>
-        )}
-      </div>
-
+    <div className="flex-1 flex flex-col min-w-0 min-h-0">
       {/* Messages area */}
       <div className="flex-1 overflow-y-auto px-4 py-4">
-        {messages.length === 0 && !hasStream && !error && (
+      {/* 数据源清单（常态化显示，有消息时默认折叠） */}
+      <div className="max-w-3xl mx-auto mb-3">
+        <DataSourcePanel defaultExpanded={messages.length === 0 && !hasStream && !error} />
+      </div>
+
+        {loadingHistory && (
+          <div className="flex items-center justify-center py-10">
+            <div className="text-center">
+              <svg className="w-5 h-5 mx-auto mb-2 text-[#58a6ff] animate-spin" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+              </svg>
+              <p className="text-xs text-[#8b949e]">加载历史消息中...</p>
+            </div>
+          </div>
+        )}
+
+        {!loadingHistory && messages.length === 0 && !hasStream && !error && (
           <div className="flex items-center justify-center h-full">
             <div className="text-center max-w-md">
               <div className="w-12 h-12 mx-auto mb-4 rounded-lg bg-[#1f6feb1a] border border-[#58a6ff33] flex items-center justify-center">
