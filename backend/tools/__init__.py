@@ -74,6 +74,14 @@ ALL_TOOLS = [
     anysearch_fallback_tool,
 ]
 
+# 原辅料基本信息速查（迁移 jiansuo3 检索内核，路线B）— 条件导入，导入失败不影响其他工具
+try:
+    from tools.sources.excipient_basic_info import excipient_basic_info_tool
+except Exception:
+    excipient_basic_info_tool = None
+if excipient_basic_info_tool is not None:
+    ALL_TOOLS.append(excipient_basic_info_tool)
+
 # 兼容旧名（保留以免其它模块引用报错）
 PHASE1_TOOLS = ALL_TOOLS
 
