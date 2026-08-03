@@ -35,7 +35,7 @@ class Citation:
 class SearchResult:
     """单个检索结果的统一容器"""
     source_name: str                            # 数据源名
-    content: str                                # 检索内容（API + 搜索摘要 ≤ 3000字符）
+    content: str                                # 检索内容（API + 搜索摘要，状态层≤retrieval_max_store_chars，默认12000字符）
     citations: list[Citation] = field(default_factory=list)
     raw_urls: list[str] = field(default_factory=list)
     success: bool = True
@@ -60,6 +60,7 @@ class AgentState(TypedDict):
     user_query: str                             # 原始用户问题
     final_answer: str                           # synthesize 生成的最终回答
     thinking_steps: list[str]                   # 思考过程记录（前端可折叠展示）
+    skip_retrieval: bool                        # 闲聊/非专业意图 → 跳过检索直接回复（短路标志）
 
     # --- understand 输出 ---
     entities: list[str]                         # 识别到的实体名（中英文均有）
@@ -96,3 +97,9 @@ class AgentState(TypedDict):
     # --- expand_queries 输出 ---
     expanded_queries: list[dict]                # 查询词扩充结果 [{dimension, queries_en, queries_zh, best_tools}]
     expanded_names: dict                         # 实体名穷举 {chemical_name, brand_names, code_names, chinese_names}
+
+    # --- 多轮记忆（尽调报告 3.2 短板修复） ---
+    session_summary: str                        # 滚动会话摘要（历史压缩后浓缩，随轮次累积）
+    summary_rounds: int                         # 已压缩的早期轮数（防重复压缩）
+    entity_memory: dict                         # 会话级实体记忆 {实体名: {aliases, mention_count, last_round}}
+    compressed_this_round: bool                 # 本轮是否已执行摘要压缩（防重入）

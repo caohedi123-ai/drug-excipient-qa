@@ -9,11 +9,28 @@ START → understand → plan → retrieve → evaluate → decide
 """
 
 import asyncio
+import logging
+from datetime import datetime, timezone
 from langgraph.graph import StateGraph, END
 from agent.state import AgentState
 from config import get_settings
 
 settings = get_settings()
+
+logger = logging.getLogger("agent.graph")
+
+# === B4: checkpointer 降级状态（供健康检查 / 运维可观测） ===
+CHECKPOINTER_STATE: dict = {
+    "backend": "unknown",
+    "degraded": False,
+    "reason": "",
+    "at": "",
+}
+
+
+def get_checkpointer_status() -> dict:
+    """返回 checkpointer 运行状态（main.py /api/health 读取）。"""
+    return dict(CHECKPOINTER_STATE)
 
 
 # === 节点 wrapper ===
@@ -60,7 +77,48 @@ async def expand_queries_node(state: AgentState) -> dict:
 async def synthesize_node(state: AgentState) -> dict:
     """synthesize: 多源整合 + 强制引用（异步化）"""
     from agent.nodes.synthesize import run_synthesize
-    return await asyncio.to_thread(run_synthesize, state)
+    result = await asyncio.to_thread(run_synthesize, state)
+    return await asyncio.to_thread(_maybe_compress_history, state, result)
+
+
+def _maybe_compress_history(state: AgentState, result: dict) -> dict:
+    """B1: 会话摘要压缩 — synthesize 完成后检查历史长度，超过阈值则滚动压缩。
+
+    仅附加 session_summary/summary_rounds 字段，不修改 messages（避免与 reducer 冲突）。
+    """
+    from agent.nodes.history_utils import should_compress, summarize_oldest
+    from langchain_openai import ChatOpenAI
+
+    messages = state.get("messages", [])
+    if not messages:
+        return result
+    compressed_this_round = state.get("compressed_this_round", False)
+    if not should_compress(len(messages), settings.history_compress_rounds, compressed_this_round):
+        return result
+
+    summary = state.get("session_summary", "") or ""
+    rounds = state.get("summary_rounds", 0) or 0
+    llm = ChatOpenAI(
+        model=settings.deepseek_model,
+        api_key=settings.deepseek_api_key,
+        base_url=settings.deepseek_base_url,
+        temperature=0.1,
+    )
+    new_summary, new_rounds = summarize_oldest(
+        messages, llm, existing_summary=summary, summary_rounds=rounds
+    )
+    if new_rounds > rounds:
+        logger.info(
+            "[memory] 会话摘要压缩: 轮次 %s -> %s（消息 %s 条）",
+            rounds, new_rounds, len(messages),
+        )
+        return {
+            **result,
+            "session_summary": new_summary,
+            "summary_rounds": new_rounds,
+            "compressed_this_round": True,
+        }
+    return result
 
 
 async def final_search_node(state: AgentState) -> dict:
@@ -70,6 +128,13 @@ async def final_search_node(state: AgentState) -> dict:
 
 
 # === 条件路由 ===
+
+def route_after_understand(state: AgentState) -> str:
+    """understand 后的路由: 闲聊意图直接结束（已有 final_answer），否则进入检索规划"""
+    if state.get("skip_retrieval"):
+        return "end_chat"
+    return "plan"
+
 
 def route_after_decide(state: AgentState) -> str:
     """decide 后的路由: synthesize / adjust_plan / final_search"""
@@ -101,7 +166,14 @@ def build_graph() -> StateGraph:
 
     # 主流程
     workflow.set_entry_point("understand")
-    workflow.add_edge("understand", "plan")
+    workflow.add_conditional_edges(
+        "understand",
+        route_after_understand,
+        {
+            "plan": "plan",
+            "end_chat": END,
+        }
+    )
     workflow.add_edge("plan", "retrieve")
     workflow.add_edge("retrieve", "evaluate")
     workflow.add_edge("evaluate", "decide")
@@ -133,28 +205,63 @@ def build_graph() -> StateGraph:
 # === 编译实例（单例） ===
 
 _graph_instance = None
+_agent_graph_lock: asyncio.Lock | None = None
 
 
-def get_agent_graph():
-    """获取编译后的 Agent 图实例（延迟初始化）"""
-    global _graph_instance
+async def get_agent_graph():
+    """获取编译后的 Agent 图实例（延迟初始化，异步 PG checkpointer）"""
+    global _graph_instance, _agent_graph_lock
+    if _agent_graph_lock is None:
+        _agent_graph_lock = asyncio.Lock()
     if _graph_instance is not None:
         return _graph_instance
 
-    graph = build_graph()
+    async with _agent_graph_lock:
+        if _graph_instance is not None:
+            return _graph_instance
 
-    # 尝试接入 PostgreSQL checkpoint，失败则用 MemorySaver 保证对话记忆可用
-    try:
-        from langgraph.checkpoint.postgres import PostgresSaver
-        checkpointer = PostgresSaver.from_conn_string(settings.database_url_sync)
-        checkpointer.setup()
-        # recursion_limit 在调用时通过 config 传入（见 main.py / 测试），
-        # 需覆盖最坏路径：understand+plan+retrieve+evaluate+decide
-        # + (adjust+plan+retrieve+evaluate+decide)*(max_rounds-1) + synthesize ≈ 5+5*(n-1)+1
-        _graph_instance = graph.compile(checkpointer=checkpointer)
-    except Exception as e:
-        from langgraph.checkpoint.memory import MemorySaver
-        print(f"[graph] PG checkpointer 不可用，降级为 MemorySaver: {e}")
-        _graph_instance = graph.compile(checkpointer=MemorySaver())
+        graph = build_graph()
+
+        # 尝试接入 PostgreSQL 异步 checkpoint，失败则用 MemorySaver 保证对话记忆可用。
+        # 注意：agent.astream()/aget_tuple 是异步路径，同步 PostgresSaver 的 aget_tuple
+        # 会抛 NotImplementedError，必须用 AsyncPostgresSaver + AsyncConnectionPool。
+        try:
+            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+            from psycopg_pool import AsyncConnectionPool
+            # psycopg 的 AsyncConnectionPool 不认 SQLAlchemy 的 +asyncpg 前缀，需转换；
+            # 若连接串已是 postgresql:// 则 replace 不匹配，原样使用。
+            conninfo = settings.database_url.replace(
+                "postgresql+asyncpg://", "postgresql://"
+            )
+            pool = AsyncConnectionPool(
+                conninfo=conninfo,
+                max_size=10,
+                open=False,
+            )
+            await pool.open()
+            checkpointer = AsyncPostgresSaver(pool)
+            await checkpointer.setup()
+            # recursion_limit 在调用时通过 config 传入（见 main.py / 测试），
+            # 需覆盖最坏路径：understand+plan+retrieve+evaluate+decide
+            # + (adjust+plan+retrieve+evaluate+decide)*(max_rounds-1) + synthesize ≈ 5+5*(n-1)+1
+            _graph_instance = graph.compile(checkpointer=checkpointer)
+            CHECKPOINTER_STATE.update(
+                backend="postgres", degraded=False, reason="", at=_now_iso()
+            )
+        except Exception as e:
+            from langgraph.checkpoint.memory import MemorySaver
+            reason = str(e)
+            logger.warning(
+                "[WARN][MEMORY-DEGRADED] PG checkpointer 不可用，降级为 MemorySaver（会话重启后丢失）: %s",
+                reason,
+            )
+            CHECKPOINTER_STATE.update(
+                backend="memory", degraded=True, reason=reason, at=_now_iso()
+            )
+            _graph_instance = graph.compile(checkpointer=MemorySaver())
 
     return _graph_instance
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()

@@ -19,6 +19,22 @@ def record(name, ok, detail=""):
         results["fail"] += 1
     print(f"[{status}] {name} {detail}")
 
+AUTH_HEADERS = {}
+
+def set_auth(token: str):
+    global AUTH_HEADERS
+    AUTH_HEADERS = {"Authorization": f"Bearer {token}"}
+
+async def login():
+    """登录获取 JWT token"""
+    async with httpx.AsyncClient(timeout=10, trust_env=False) as c:
+        r = await c.post(f"{BASE}/api/auth/login", json={"username": "admin", "password": "admin@2024"})
+        data = r.json()
+        if data.get("ok"):
+            set_auth(data["token"])
+            return True, data["token"][:20] + "..."
+        return False, data.get("message", "login failed")
+
 async def test_sse_direct():
     """测试 1: 直接连接后端 SSE"""
     print("\n=== Test 1: Direct Backend SSE ===")
@@ -30,7 +46,7 @@ async def test_sse_direct():
         async with client.stream(
             "POST", f"{BASE}/api/chat",
             json={"query": "aspirin molecular weight", "conversation_id": None, "thread_id": None},
-            headers={"Accept": "text/event-stream"}
+            headers={"Accept": "text/event-stream", **AUTH_HEADERS}
         ) as resp:
             record("SSE direct: status 200", resp.status_code == 200, f"got {resp.status_code}")
             record("SSE direct: Content-Type", 
@@ -67,8 +83,11 @@ async def test_sse_direct():
     record("SSE direct: has [DONE]", len(done_events) > 0)
     
     if answer_events:
-        content = answer_events[0][1].get("content", "")
-        record("SSE direct: answer not empty", len(content) > 50, f"{len(content)} chars")
+        # 增量流式：答案被拆为多个分块，需拼接后判断完整性；citations 仅末块携带
+        content = "".join(e[1].get("content", "") for e in answer_events)
+        citations = answer_events[-1][1].get("citations", [])
+        record("SSE direct: answer not empty", len(content) > 50, f"{len(content)} chars (joined {len(answer_events)} chunks)")
+        record("SSE direct: has citations", len(citations) > 0, f"{len(citations)} citations (last chunk)")
     
     return events
 
@@ -76,7 +95,8 @@ async def test_sse_direct():
 async def test_sse_via_proxy():
     """测试 2: 通过 Vite 代理的 SSE"""
     print("\n=== Test 2: Via Vite Proxy SSE ===")
-    events = []
+    events = []          # (etype, data)
+    event_times = []     # 记录每个事件到达的绝对时间，用于检测是否流式分散到达（无缓冲）
     start = time.time()
     first_event_time = None
     
@@ -84,7 +104,7 @@ async def test_sse_via_proxy():
         async with client.stream(
             "POST", f"{PROXY}/api/chat",
             json={"query": "ibuprofen molecular weight and formula", "conversation_id": None, "thread_id": None},
-            headers={"Accept": "text/event-stream"}
+            headers={"Accept": "text/event-stream", **AUTH_HEADERS}
         ) as resp:
             record("SSE proxy: status 200", resp.status_code == 200, f"got {resp.status_code}")
             ct = resp.headers.get("content-type", "")
@@ -98,21 +118,19 @@ async def test_sse_via_proxy():
                     data_str = line[6:]
                     if data_str == "[DONE]":
                         events.append(("done", data_str))
+                        event_times.append(time.time())
                         continue
                     try:
                         data = json.loads(data_str)
                         etype = data.get("type", "?")
                         events.append((etype, data))
+                        event_times.append(time.time())
                         if first_event_time is None:
                             first_event_time = time.time()
                             elapsed = first_event_time - start
                             print(f"  First event: '{etype}' at +{elapsed:.2f}s (line #{line_count})")
-                            # 关键检测：第一个事件是否在响应开始后的合理时间内到达
+                            # 首事件（understand 节点 LLM 调用产出）到达时间：受 LLM 首响应延迟影响，15s 为容差
                             record("SSE proxy: first event < 15s", elapsed < 15, f"+{elapsed:.1f}s")
-                            if elapsed < 5:
-                                record("SSE proxy: streaming OK (no buffering)", True, f"first event at +{elapsed:.1f}s")
-                            else:
-                                record("SSE proxy: streaming OK (no buffering)", False, f"first event at +{elapsed:.1f}s > 5s (may be buffered)")
                     except json.JSONDecodeError:
                         events.append(("parse_error", data_str[:80]))
     
@@ -128,11 +146,23 @@ async def test_sse_via_proxy():
     record("SSE proxy: has answer event", len(answer_events) > 0)
     record("SSE proxy: has [DONE]", len(done_events) > 0)
     
+    # 无缓冲检测：事件应流式分散到达（事件间存在明显时间间隔），而非代理缓冲后一次性 dump。
+    # 若代理缓冲，所有 data 行会在流结束时几乎同时到达（事件间间隔≈0）。
+    if len(event_times) >= 2:
+        gaps = [event_times[i+1] - event_times[i] for i in range(len(event_times) - 1)]
+        first_gap = gaps[0]
+        max_gap = max(gaps)
+        streaming = first_gap > 0.05 and max_gap < total_time + 1
+        record("SSE proxy: streaming OK (no buffering)", streaming,
+               f"first_gap={first_gap:.2f}s max_gap={max_gap:.1f}s events={len(event_times)}")
+    else:
+        record("SSE proxy: streaming OK (no buffering)", False, "fewer than 2 events")
+    
     if answer_events:
-        content = answer_events[0][1].get("content", "")
-        citations = answer_events[0][1].get("citations", [])
-        record("SSE proxy: answer not empty", len(content) > 50, f"{len(content)} chars")
-        record("SSE proxy: has citations", len(citations) > 0, f"{len(citations)} citations")
+        content = "".join(e[1].get("content", "") for e in answer_events)
+        citations = answer_events[-1][1].get("citations", [])
+        record("SSE proxy: answer not empty", len(content) > 50, f"{len(content)} chars (joined {len(answer_events)} chunks)")
+        record("SSE proxy: has citations", len(citations) > 0, f"{len(citations)} citations (last chunk)")
     
     return events
 
@@ -146,7 +176,7 @@ async def test_aspirin_dosage():
         async with client.stream(
             "POST", f"{BASE}/api/chat",
             json={"query": "阿司匹林用法用量 成人剂量 每日最大剂量", "conversation_id": None, "thread_id": None},
-            headers={"Accept": "text/event-stream"}
+            headers={"Accept": "text/event-stream", **AUTH_HEADERS}
         ) as resp:
             record("Aspirin: status 200", resp.status_code == 200)
             
@@ -175,15 +205,15 @@ async def test_aspirin_dosage():
     record("Aspirin: has [DONE]", len(done_events) > 0)
     
     if answer_events:
-        content = answer_events[0][1].get("content", "")
-        citations = answer_events[0][1].get("citations", [])
-        conv_id = answer_events[0][1].get("conversation_id", "")
+        content = "".join(e[1].get("content", "") for e in answer_events)
+        citations = answer_events[-1][1].get("citations", [])
+        conv_id = answer_events[-1][1].get("conversation_id", "")
         
-        print(f"  Answer: {len(content)} chars")
+        print(f"  Answer: {len(content)} chars (joined {len(answer_events)} chunks)")
         print(f"  Citations: {len(citations)}")
         print(f"  Preview: {content[:200]}...")
         
-        record("Aspirin: answer > 100 chars", len(content) > 100, f"{len(content)} chars")
+        record("Aspirin: answer > 100 chars", len(content) > 100, f"{len(content)} chars (joined)")
         record("Aspirin: has citations", len(citations) > 0, f"{len(citations)}")
         record("Aspirin: has conversation_id", bool(conv_id), f"conv={conv_id[:8]}")
         
@@ -225,6 +255,10 @@ async def main():
         record("Health: backend 18082", r.json()["status"] == "ok")
         r2 = await c.get(f"{PROXY}/api/health")
         record("Health: Vite proxy 5173", r2.json()["status"] == "ok")
+
+    # Login
+    ok, detail = await login()
+    record("Login: admin", ok, detail)
     
     await test_sse_direct()
     await test_sse_via_proxy()

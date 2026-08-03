@@ -8,7 +8,7 @@ import asyncio
 
 from langchain_core.tools import tool
 from agent.state import Citation, SearchResult
-from tools.engines.anysearch_engine import anysearch_vertical
+from tools.engines.anysearch_engine import anysearch_batch
 
 
 @tool
@@ -24,8 +24,15 @@ async def sider_tool(query: str) -> str:
 
 
 async def _search_sider(query: str) -> SearchResult:
-    r1 = await asyncio.to_thread(anysearch_vertical, query + " side effects adverse reactions", domain="health", max_results=6)
-    r2 = await asyncio.to_thread(anysearch_vertical, query + " adverse drug reaction frequency", domain="academic", max_results=6)
+    # health + academic 合并为 1 次 batch_search（配额友好）
+    results = await asyncio.to_thread(anysearch_batch, [
+        {"query": query + " side effects adverse reactions",
+         "domain": "health", "sub_domain": "health.drug",
+         "sub_domain_params": {"type": "name"}, "max_results": 6},
+        {"query": query + " adverse drug reaction frequency",
+         "domain": "academic", "sub_domain": "academic.biomedical", "max_results": 6},
+    ])
+    r1, r2 = results[0], results[1] if len(results) > 1 else results[0]
     citations = list(r1.citations) + list(r2.citations)
     content = "\n\n".join([r1.content, r2.content])
     if "No results" in r1.content and "No results" in r2.content:

@@ -29,15 +29,29 @@ export const MessageBubble: FC<MessageBubbleProps> = ({ message }) => {
     }
   }, [message.content])
 
-  // 预处理：将 [N] 引用角标替换为带样式的 HTML sup 标签
+  // 预处理：将 [N] 引用角标替换为带样式的 HTML sup 标签（带 data-cidx 供点击跳转）
   // 正则：只匹配独立的 [数字] 模式，不匹配 Markdown 链接 [text](url) 中的括号
   const processedContent = useMemo(() => {
     if (isUser) return message.content
     return message.content.replace(
       /(?<!\]\()\[(\d+)\]/g,
-      '<sup class="citation-badge">[$1]</sup>',
+      '<sup class="citation-badge" data-cidx="$1">[$1]</sup>',
     )
   }, [message.content, isUser])
+
+  // 点击角标：有 URL 则打开对应参考来源，否则滚动定位到引用面板
+  const handleBubbleClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    const target = e.target as HTMLElement
+    const badge = target.closest('.citation-badge') as HTMLElement | null
+    if (!badge) return
+    const idx = Number(badge.dataset.cidx || '0')
+    const cite = message.citations?.[idx - 1]
+    if (cite?.source_url) {
+      window.open(cite.source_url, '_blank', 'noopener,noreferrer')
+    } else {
+      document.getElementById('reference-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    }
+  }, [message.citations])
 
   return (
     <div className={`flex gap-2 ${isUser ? 'flex-row-reverse' : ''}`}>
@@ -60,7 +74,7 @@ export const MessageBubble: FC<MessageBubbleProps> = ({ message }) => {
               {message.content}
             </div>
           ) : (
-            <div className="text-sm break-words markdown-body">
+            <div className="text-sm break-words markdown-body" onClick={handleBubbleClick}>
               <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeRaw]}>
                 {processedContent}
               </ReactMarkdown>

@@ -8,7 +8,7 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://localhost:8000',
+        target: 'http://localhost:18082',
         changeOrigin: true,
         // === SSE 流式代理关键配置 ===
         // 关键：仅移除 content-encoding 防止 gzip 缓冲 SSE 流。

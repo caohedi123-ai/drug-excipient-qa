@@ -1,5 +1,6 @@
 """FastAPI 应用入口 - SSE 流式 Chat 服务"""
 
+import os
 import json
 import re
 import uuid
@@ -29,12 +30,12 @@ except Exception:
 
 settings = get_settings()
 
-# ── JWT 认证配置 ──
-JWT_SECRET = "pharma-knowledge-assistant-2024-secret-key"
+# ── JWT 认证配置（支持环境变量注入；公网部署务必通过 .env 覆盖 JWT_SECRET 与 ADMIN_PASSWORD）──
+JWT_SECRET = os.environ.get("JWT_SECRET", "pharma-knowledge-assistant-2024-secret-key")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_HOURS = 24
-FIXED_USERNAME = "admin"
-FIXED_PASSWORD_HASH = hashlib.sha256("admin@2024".encode()).hexdigest()
+FIXED_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
+FIXED_PASSWORD_HASH = hashlib.sha256(os.environ.get("ADMIN_PASSWORD", "admin@2024").encode()).hexdigest()
 
 # ── 认证依赖 ──
 async def requires_auth(authorization: str = Header(None)):
@@ -103,6 +104,19 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[WARN] Redis 初始化失败，跳过（不影响问答）: {e}", flush=True)
 
+    # B4: 启动时显式探测 checkpointer（PG 可用性），失败降级 MemorySaver 并告警
+    try:
+        from agent.graph import get_agent_graph, get_checkpointer_status
+        await get_agent_graph()  # 触发编译 + checkpointer 探测
+        cp = get_checkpointer_status()
+        if cp.get("degraded"):
+            print(
+                f"[WARN][MEMORY-DEGRADED] checkpointer 降级为 MemorySaver: {cp.get('reason')}；"
+                "会话历史在进程重启后将丢失。", flush=True
+            )
+    except Exception as e:
+        print(f"[WARN] Agent 图初始化失败（不影响健康检查）: {e}", flush=True)
+
     # 表结构创建失败也只告警，避免 lifespan 抛异常导致所有接口返回 500
     try:
         with sync_engine.connect() as conn:
@@ -168,6 +182,12 @@ async def lifespan(app: FastAPI):
         await close_redis()
     except Exception:
         pass
+    # 关闭 ChEMBL MCP 子进程（避免 node 进程泄漏）
+    try:
+        from tools.sources.chembl_mcp_client import close_client
+        await close_client()
+    except Exception as e:  # noqa
+        print(f"[WARN] 关闭 ChEMBL MCP 客户端失败: {e}", flush=True)
 
 
 app = FastAPI(
@@ -193,7 +213,7 @@ app.add_middleware(
 # === Chat 端点 (SSE 流式) ===
 @app.post("/api/chat")
 async def chat(http_request: Request, req: ChatRequest, user: str = Depends(requires_auth)):
-    agent = get_agent_graph()
+    agent = await get_agent_graph()
     query = sanitize_query(req.query, max_len=2000)  # 入口仅清洗控制字符/零宽，保留长问实体（截断由各源内部处理）
 
     async def event_generator():
@@ -548,7 +568,8 @@ async def delete_lookup_history(history_id: str, user: str = Depends(requires_au
 # === 健康检查 ===
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "version": "0.1.0"}
+    from agent.graph import get_checkpointer_status
+    return {"status": "ok", "version": "0.1.0", "checkpointer": get_checkpointer_status()}
 
 
 if __name__ == "__main__":

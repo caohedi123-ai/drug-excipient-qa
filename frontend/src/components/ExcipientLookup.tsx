@@ -45,11 +45,16 @@ const EntityCard: FC<{ entity: ExcipientLookupEntity; basicFields: Array<{key:st
   )
 }
 
-// ── 模块卡片（Markdown 格式化 + 中英翻译切换）──
+// ── 模块卡片（Markdown 格式化 + 中英翻译切换 + 长文本折叠）──
 const ModuleCard: FC<{ moduleName: string; moduleData: LookupModule }> = ({ moduleName, moduleData }) => {
   const { fields, text_parts, text_parts_cn } = moduleData
   const [showCN, setShowCN] = useState(false)
+  const [expanded, setExpanded] = useState(false)
   const hasCN = text_parts_cn && text_parts_cn.length > 0
+  // 长文本默认折叠：超过 8 行或 600 字即收起，展示前 6 行
+  const fullText = (text_parts || []).join('\n\n')
+  const isLong = fullText.split('\n').length > 8 || fullText.length > 600
+  const shownText = isLong && !expanded ? fullText.split('\n').slice(0, 6).join('\n') + '\n\n…（内容较长，点击展开查看完整）' : fullText
 
   return (
     <div className="bg-[#161b22] border border-[#21262d] rounded-md p-3">
@@ -84,9 +89,17 @@ const ModuleCard: FC<{ moduleName: string; moduleData: LookupModule }> = ({ modu
         <div>
           <div className="markdown-body text-xs leading-relaxed">
             <ReactMarkdown remarkPlugins={[remarkGfm]}>
-              {text_parts.join('\n\n')}
+              {shownText}
             </ReactMarkdown>
           </div>
+          {isLong && (
+            <button
+              onClick={() => setExpanded(!expanded)}
+              className="mt-2 text-[11px] text-[#58a6ff] hover:text-[#79c0ff] transition-colors"
+            >
+              {expanded ? '收起' : `展开全文 (${fullText.split('\n').length} 行)`}
+            </button>
+          )}
           {/* 中文翻译切换 */}
           {hasCN && (
             <>

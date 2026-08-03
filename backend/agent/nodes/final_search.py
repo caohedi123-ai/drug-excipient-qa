@@ -11,6 +11,7 @@ import re
 
 from agent.state import AgentState
 from config import get_settings
+from agent.nodes.context_budget import truncate_with_ellipsis
 
 settings = get_settings()
 
@@ -94,17 +95,26 @@ def run_final_search(state: AgentState) -> dict:
         ])
         queries = _extract_queries(resp.content, user_query)
 
-        # 调用 AnySearch：health 优先，无果转 academic
+        # 调用 AnySearch：health 优先 + academic 并行兜底，合并为 1 次 batch（配额友好）
         added_results = []
+        batch_items = []
         for q in queries:
-            r = anysearch_engine.anysearch_vertical(q, domain="health", max_results=8)
-            if "No results" in r.content:
-                r = anysearch_engine.anysearch_vertical(q, domain="academic", max_results=8)
-            has_citations = bool(r.citations)
+            # 每个 query 同时发起 health 垂直 + academic 生物医学双通道，一次 batch 全含
+            batch_items.append({"query": q, "domain": "health", "max_results": 8})
+            batch_items.append({"query": q, "domain": "academic",
+                                "sub_domain": "academic.biomedical", "max_results": 8})
+        batch_res = anysearch_engine.anysearch_batch(batch_items)
+        for i, q in enumerate(queries):
+            r_health = batch_res[i * 2] if i * 2 < len(batch_res) else None
+            r_acad = batch_res[i * 2 + 1] if i * 2 + 1 < len(batch_res) else None
+            r = r_health if (r_health and "No results" not in r_health.content) else r_acad
+            if r is None:
+                r = r_health
+            has_citations = bool(r and r.citations)
             added_results.append({
                 "source_name": "anysearch_fallback",
-                "content": r.content[:3000],
-                "citations": [c.to_dict() for c in r.citations],
+                "content": truncate_with_ellipsis(r.content, settings.retrieval_max_store_chars),
+                "citations": [c.to_dict() for c in r.citations] if r else [],
                 "success": has_citations,
                 "failure": not has_citations,
             })

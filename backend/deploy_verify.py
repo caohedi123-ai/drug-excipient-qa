@@ -2,7 +2,7 @@ import asyncio, json, sys
 from agent.graph import get_agent_graph
 
 async def test():
-    graph = get_agent_graph()
+    graph = await get_agent_graph()
     state = {
         'messages': [],
         'user_query': '阿司匹林的作用机制是什么',

@@ -25,9 +25,10 @@ async def cde_tool(query: str) -> str:
 
 
 async def _search_cde(query: str) -> SearchResult:
-    return await asyncio.to_thread(anysearch_vertical, 
-        query + " 药品审评",
+    # 结论式检索：直接问批准/上市/参比制剂/受理号，而非泛搜"药品审评"新闻流。
+    # 注意：不用 freshness="past_year"，附条件批准/参比制剂结论常早于一年。
+    return await asyncio.to_thread(anysearch_vertical,
+        f"{query} 国家药监局 NMPA 批准上市 受理号 参比制剂",
         domain="health",
-        freshness="past_year",
         max_results=8,
     )

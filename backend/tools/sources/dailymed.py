@@ -36,8 +36,14 @@ TARGET_SECTIONS = [
 ]
 
 
-def _extract_sections_from_xml(xml_text: str, max_chars: int = 5000) -> str:
-    """从 SPL XML 提取目标章节内容"""
+def _extract_sections_from_xml(
+    xml_text: str, max_chars: int = 12000, section_max_chars: int = 2000
+) -> str:
+    """从 SPL XML 提取目标章节内容
+
+    max_chars: 总返回字符上限（默认放开到 12000）
+    section_max_chars: 单个章节上限（放开到 2000，避免长章节被过度截断）
+    """
     try:
         # 移除命名空间前缀（SPL XML 可能有多个命名空间）
         xml_clean = re.sub(r'<(/)?[a-zA-Z0-9_]+:', r'<\1', xml_text)
@@ -61,7 +67,7 @@ def _extract_sections_from_xml(xml_text: str, max_chars: int = 5000) -> str:
                         text = ' '.join(parent.itertext()) if parent is not None else ''
                         text = re.sub(r'\s+', ' ', text).strip()
                         if len(text) > 50:  # 过滤空章节
-                            sections_found.append(f"### {section_name}\n{text[:800]}")
+                            sections_found.append(f"### {section_name}\n{text[:section_max_chars]}")
                         break
 
             if len('\n'.join(sections_found)) > max_chars:
@@ -105,6 +111,16 @@ async def _search_dailymed(query: str) -> SearchResult:
             if resp.status_code == 200:
                 data = resp.json()
                 spls = data.get("data", [])
+                # 一致性校验：spls.json 为全文搜索，可能返回无关药品的 SPL（如搜 Acalabrutinib 返回
+                # METOPROLOL 说明书）。brand/generic 必须与查询词核心 token 匹配，否则丢弃该 SPL。
+                q_core = re.sub(r"[^a-z0-9]+", "", query.lower())
+                matched_spls = []
+                for spl in spls:
+                    hay = f"{spl.get('brand_name', '') or ''} {spl.get('generic_name', '') or spl.get('substance_name', '') or ''}".lower()
+                    hay_core = re.sub(r"[^a-z0-9]+", "", hay)
+                    if not q_core or len(q_core) < 4 or q_core in hay_core or hay_core in q_core:
+                        matched_spls.append(spl)
+                spls = matched_spls or spls  # 全部不匹配时退回原列表（避免误杀同义词查询）
                 for i, spl in enumerate(spls[:5], 1):
                     setid = spl.get("setid", "")
                     brand = spl.get("brand_name", query)
@@ -121,7 +137,7 @@ async def _search_dailymed(query: str) -> SearchResult:
                                 timeout=15.0,
                             )
                             if xml_resp.status_code == 200:
-                                section_text = _extract_sections_from_xml(xml_resp.text, max_chars=4000)
+                                section_text = _extract_sections_from_xml(xml_resp.text, max_chars=12000)
                         except Exception:
                             pass
 
@@ -145,9 +161,13 @@ async def _search_dailymed(query: str) -> SearchResult:
                         ))
 
         if content_parts:
+            # 多 SPL 场景：至多保留前 2 个结果（各自已在章节层截断），
+            # 整体再以 12000 字符钳制，避免拼接超限
+            limited_parts = content_parts[:2]
+            content = "\n\n".join(limited_parts)
             return SearchResult(
                 source_name="DailyMed",
-                content="\n\n".join(content_parts)[:5000],
+                content=content[:12000],
                 citations=citations,
                 success=True,
             )

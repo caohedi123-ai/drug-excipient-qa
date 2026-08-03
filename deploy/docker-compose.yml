@@ -1,0 +1,68 @@
+# ============================================================
+# 药物原辅料知识问答助手 - 生产部署编排
+# 四容器：nginx(前端) + backend(FastAPI) + postgres + redis
+# 使用：cd deploy && docker compose up -d --build
+# ============================================================
+
+services:
+  # ── 数据库 ──
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: pharma_kb
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # 首次启动自动建表（init.sql 中的 CREATE DATABASE 会被跳过，POSTGRES_DB 已建好库）
+      - ../backend/db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d pharma_kb"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ── 缓存（对话记忆 / 限流）──
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    restart: unless-stopped
+
+  # ── 后端 API ──
+  backend:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    env_file: .env
+    environment:
+      # 容器间用服务名互通，覆盖本地 localhost 配置
+      DATABASE_URL: postgresql+asyncpg://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/pharma_kb
+      DATABASE_URL_SYNC: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/pharma_kb
+      REDIS_URL: redis://redis:6379/0
+      HOST: 0.0.0.0
+      PORT: 18082
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: unless-stopped
+
+  # ── 前端静态文件 + API 反向代理（含 SSE 流式支持）──
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ../frontend/dist:/usr/share/nginx/html:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:

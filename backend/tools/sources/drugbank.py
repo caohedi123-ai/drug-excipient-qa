@@ -14,8 +14,8 @@ from tools.engines.tavily_engine import tavily_domain_search
 
 @tool
 async def drugbank_tool(query: str) -> str:
-    """查询药物综合信息：靶点、作用机制(MOA)、适应症、PK参数、药物相互作用。
-    适用场景：查询药物的完整药理学画像、ADMET参数、DDI相互作用。
+    """查询药物基础信息（经 Tavily 域名搜索 go.drugbank.com，非 DrugBank 官方 API）：常见靶点/适应症/相互作用的网页摘要。
+    适用场景：作为 DrugBank 官方 API 缺失时的网页检索兜底，获取概览性信息；数据成色低于官方 API，仅供参考。
     Input: 药物名/DrugBank ID（英文搜索效果更好）"""
     result = await _search_drugbank(query)
     if not result.success:

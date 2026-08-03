@@ -1,0 +1,28 @@
+# ============================================================
+# 药物原辅料知识问答助手 - 后端镜像
+# Python 3.11 + FastAPI + LangGraph
+# 构建：docker build -f deploy/Dockerfile.backend -t pharma-backend .
+# ============================================================
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+
+# 先装依赖（利用 Docker 层缓存，代码变更不重复装包）
+COPY backend/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 复制后端代码
+COPY backend/ /app/
+
+EXPOSE 18082
+
+# 健康检查（后端有 /api/health 端点）
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18082/api/health', timeout=3)" || exit 1
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "18082"]

@@ -5,6 +5,7 @@ import { ExcipientLookup } from './components/ExcipientLookup'
 import LoginPage from './components/LoginPage'
 import { AuthProvider, useAuth } from './lib/AuthContext'
 import { fetchLookupHistory, fetchConversations } from './lib/api'
+import { uuid } from './lib/uuid'
 import type { Conversation, LookupHistoryItem } from './types'
 import type { ExcipientLookupResult } from './lib/api'
 
@@ -63,12 +64,12 @@ function AppContent() {
   }, [isLoggedIn, loadHistory, lookupRefreshKey])
 
   const handleNewConversation = useCallback(() => {
-    const id = crypto.randomUUID()
+    const id = uuid()
     const now = new Date().toISOString()
     const conv: Conversation = {
       id,
       title: '新问答',
-      thread_id: crypto.randomUUID(),
+      thread_id: uuid(),
       created_at: now,
       updated_at: now,
     }
@@ -88,6 +89,8 @@ function AppContent() {
       }
       return [{ ...conv, updated_at: new Date().toISOString() }, ...prev]
     })
+    // 新会话且当前无激活会话 → 自动激活，保证 ChatContainer 能收到 conversation prop
+    setActiveId(prev => prev ?? conv.id)
     activeConvRef.current = conv
   }, [])
 

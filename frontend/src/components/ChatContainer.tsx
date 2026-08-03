@@ -6,7 +6,8 @@ import { MessageBubble } from './MessageBubble'
 import { ThinkingProcess } from './ThinkingProcess'
 import { ReferenceList } from './ReferenceList'
 import DataSourcePanel from './DataSourcePanel'
-import { sendChatMessage, abortActiveRequest, isRequestActive, fetchConversationMessages } from '../lib/api'
+import { sendChatMessage, abortActiveRequest, fetchConversationMessages } from '../lib/api'
+import { uuid } from '../lib/uuid'
 import type { Conversation, Message } from '../types'
 
 interface ChatContainerProps {
@@ -28,6 +29,16 @@ interface RefItem {
   score?: number
   url?: string
   snippet?: string
+}
+
+// 单个会话的运行时状态（供 applyConvState 统一读写，实现多会话并行互不干扰）
+interface ConvRuntimeState {
+  messages: Message[]
+  streamingContent: string
+  thinkingSteps: ThinkingStep[]
+  references: RefItem[]
+  error: string | null
+  isStreaming: boolean
 }
 
 export const ChatContainer: FC<ChatContainerProps> = ({
@@ -64,14 +75,43 @@ export const ChatContainer: FC<ChatContainerProps> = ({
   streamingRef.current = isStreaming
 
   // 跨会话状态持久化：切换对话时保存当前→恢复目标
-  const savedStatesRef = useRef<Map<string, {
-    messages: Message[]
-    streamingContent: string
-    thinkingSteps: ThinkingStep[]
-    references: RefItem[]
-    error: string | null
-    isStreaming: boolean
-  }>>(new Map())
+  const savedStatesRef = useRef<Map<string, ConvRuntimeState>>(new Map())
+
+  // ── 多会话并发支持：统一状态读写入口 ──
+  // convId 等于当前显示会话 → 直接更新组件 state；
+  // 否则写入该会话缓存（后台流式增量累积），切换回该会话时由 useEffect 恢复，
+  // 实现「多个会话同时提问、内容互不干扰」。
+  const applyConvState = useCallback((
+    convId: string | undefined,
+    updater: (s: ConvRuntimeState) => ConvRuntimeState,
+  ) => {
+    if (convId && convId === conversationRef.current?.id) {
+      const next = updater({
+        messages: msgsRef.current,
+        streamingContent: streamRef.current,
+        thinkingSteps: stepsRef.current,
+        references: refsRef.current,
+        error: errRef.current,
+        isStreaming: streamingRef.current,
+      })
+      setMessages(next.messages)
+      setStreamingContent(next.streamingContent)
+      setThinkingSteps(next.thinkingSteps)
+      setReferences(next.references)
+      setError(next.error)
+      setIsStreaming(next.isStreaming)
+    } else if (convId) {
+      const cur = savedStatesRef.current.get(convId) ?? {
+        messages: [],
+        streamingContent: '',
+        thinkingSteps: [],
+        references: [],
+        error: null,
+        isStreaming: false,
+      }
+      savedStatesRef.current.set(convId, updater(cur))
+    }
+  }, [])
 
   useEffect(() => {
     const newId = conversation?.id ?? null
@@ -103,37 +143,92 @@ export const ChatContainer: FC<ChatContainerProps> = ({
         setIsStreaming(saved.isStreaming)
       } else {
         // 未缓存 —— 从后端加载历史消息
-        setMessages([])
-        setStreamingContent('')
-        setThinkingSteps([])
-        setReferences([])
-        setError(null)
+        // 若本地已有消息（如刚发起提问的新会话），不得清空覆盖
+        const hasLocal = msgsRef.current.length > 0
+        if (!hasLocal) {
+          setMessages([])
+          setStreamingContent('')
+          setThinkingSteps([])
+          setReferences([])
+          setError(null)
+        }
         setIsStreaming(false)
         setLoadingHistory(true)
         fetchConversationMessages(newId)
           .then(backendMsgs => {
-            if (backendMsgs && backendMsgs.length > 0) {
+            // 仅当仍显示该会话时才允许写入，避免污染切换后的当前会话
+            if (conversationRef.current?.id !== newId) return
+            if (backendMsgs && backendMsgs.length > 0 && msgsRef.current.length === 0) {
               const loaded: Message[] = backendMsgs.map((m: any) => ({
-                id: m.id || crypto.randomUUID(),
+                id: m.id || uuid(),
                 role: m.role as 'user' | 'assistant',
                 content: m.content || '',
+                // 恢复后端已持久化的引用与思考过程（刷新后不再丢失）
+                citations: Array.isArray(m.citations)
+                  ? m.citations.map((c: any) => ({
+                      source_name: c.source_name || c.sourceName || '',
+                      source_url: c.source_url || c.sourceUrl || '',
+                      snippet: c.snippet || '',
+                    }))
+                  : undefined,
+                thinking_steps: Array.isArray(m.thinking_steps)
+                  ? m.thinking_steps.map((s: any) => String(s))
+                  : undefined,
                 timestamp: m.timestamp || m.created_at || new Date().toISOString(),
               }))
               skipAutoScrollRef.current = true  // 加载历史不自动滚到底部
               setMessages(loaded)
+              // 从最后一条 assistant 消息重建「思考过程 / 参考来源」面板
+              const lastAsst = [...loaded].reverse().find(m => m.role === 'assistant')
+              const restoredRefs: RefItem[] = []
+              const restoredSteps: ThinkingStep[] = []
+              if (lastAsst?.citations) {
+                const seen = new Set<string>()
+                for (const c of lastAsst.citations) {
+                  const name = c.source_name || ''
+                  const url = c.source_url || ''
+                  if (url && seen.has(url)) continue
+                  if (url) seen.add(url)
+                  let source = 'web'
+                  if (/iig/i.test(name)) source = 'fda_iig'
+                  else if (/unii/i.test(name)) source = 'fda_unii'
+                  else if (/pubchem/i.test(name)) source = 'pubchem'
+                  else if (/drugbank/i.test(name)) source = 'drugbank'
+                  else if (/dailymed/i.test(name)) source = 'dailymed'
+                  else if (/wikipedia/i.test(name)) source = 'wikipedia'
+                  else if (/pubmed/i.test(name)) source = 'pubmed'
+                  restoredRefs.push({
+                    source,
+                    sourceName: name,
+                    title: name,
+                    subtitle: c.snippet ? c.snippet.slice(0, 160) : undefined,
+                    snippet: c.snippet || '',
+                    url,
+                  })
+                }
+              }
+              if (lastAsst?.thinking_steps) {
+                restoredSteps.push(
+                  ...lastAsst.thinking_steps.map(label => ({ label, status: 'done' as const })),
+                )
+              }
+              setThinkingSteps(restoredSteps)
+              setReferences(restoredRefs)
               // 缓存到 savedStatesRef，避免重复加载
               savedStatesRef.current.set(newId, {
                 messages: loaded,
                 streamingContent: '',
-                thinkingSteps: [],
-                references: [],
+                thinkingSteps: restoredSteps,
+                references: restoredRefs,
                 error: null,
                 isStreaming: false,
               })
             }
           })
           .catch(err => console.warn('加载会话消息失败:', err))
-          .finally(() => setLoadingHistory(false))
+          .finally(() => {
+            if (conversationRef.current?.id === newId) setLoadingHistory(false)
+          })
       }
     }
 
@@ -152,7 +247,7 @@ export const ChatContainer: FC<ChatContainerProps> = ({
   const handleSend = useCallback((question: string) => {
     if (!question.trim()) return
 
-    // reset states
+    // reset states（发送时该会话必为当前显示会话，直接 setState 即可）
     setStreamingContent('')
     setThinkingSteps([])
     setReferences([])
@@ -162,7 +257,7 @@ export const ChatContainer: FC<ChatContainerProps> = ({
 
     // add user message with id
     const userMsg: Message = {
-      id: crypto.randomUUID(),
+      id: uuid(),
       role: 'user',
       content: question,
       timestamp: ts,
@@ -172,40 +267,45 @@ export const ChatContainer: FC<ChatContainerProps> = ({
     // 确保有稳定的 thread_id，保证后端会话连续性（修复 thread_id 缺失导致每次新建会话）
     const conv = conversationRef.current
     let threadId = conv?.thread_id ?? null
+    let convId = conv?.id
     if (!conv || !conv.thread_id) {
-      const newThreadId = crypto.randomUUID()
+      const newThreadId = uuid()
       threadId = newThreadId
       const newConv: Conversation = conv
         ? { ...conv, thread_id: newThreadId }
         : {
-            id: crypto.randomUUID(),
+            id: uuid(),
             title: question.slice(0, 30),
             thread_id: newThreadId,
             created_at: ts,
             updated_at: ts,
           }
+      convId = newConv.id
       onUpdate(newConv)
     }
     setIsStreaming(true)
 
+    // 请求隔离键 = thread_id：跨会话并行互不干扰，同会话内新请求自动中断旧请求。
+    // 所有异步回调按会话隔离写入（applyConvState），切换会话后流式结果仍归属原会话。
     sendChatMessage(question, threadId, {
       onStep: ({ steps }) => {
         // 后端每次推送完整的 thinking_steps 累积列表；最后一条为「当前正在思考」
-        setThinkingSteps(
-          steps.map((s, i) => ({
-            label: s,
+        applyConvState(convId, s => ({
+          ...s,
+          thinkingSteps: steps.map((st, i) => ({
+            label: st,
             status: (i < steps.length - 1 ? 'done' : 'active') as ThinkingStep['status'],
           })),
-        )
+        }))
       },
       onSources: (sources) => {
-        setReferences(prev => {
+        applyConvState(convId, s => {
           // 去重：同一 sourceUrl 只保留一次
-          const seen = new Set(prev.map(r => r.url))
+          const seen = new Set(s.references.map(r => r.url))
           const newItems: RefItem[] = []
-          for (const s of sources) {
-            const name = s.sourceName || s.title || ''
-            const url = s.sourceUrl || ''
+          for (const src of sources) {
+            const name = src.sourceName || src.title || ''
+            const url = src.sourceUrl || ''
             if (url && seen.has(url)) continue
             if (url) seen.add(url)
             let source = 'web'
@@ -219,60 +319,83 @@ export const ChatContainer: FC<ChatContainerProps> = ({
             newItems.push({
               source,
               sourceName: name,
-              title: s.title || name,
-              subtitle: s.snippet ? s.snippet.slice(0, 160) : undefined,
-              snippet: s.snippet || '',
+              title: src.title || name,
+              subtitle: src.snippet ? src.snippet.slice(0, 160) : undefined,
+              snippet: src.snippet || '',
               url,
             })
           }
-          return [...prev, ...newItems]
+          return { ...s, references: [...s.references, ...newItems] }
         })
       },
       onToken: (token) => {
-        setStreamingContent(prev => prev + token)
+        applyConvState(convId, s => ({ ...s, streamingContent: s.streamingContent + token }))
       },
       onDone: (finalAnswer) => {
-        if (finalAnswer) {
-          const assistantMsg: Message = {
-            id: crypto.randomUUID(),
-            role: 'assistant',
-            content: finalAnswer,
-            timestamp: new Date().toISOString(),
+        applyConvState(convId, s => {
+          let next = {
+            ...s,
+            isStreaming: false,
+            streamingContent: '',
+            // 保留思考过程与参考来源，便于用户回看「问题拆解情况」
+            thinkingSteps: s.thinkingSteps.map(t => ({ ...t, status: 'done' as const })),
           }
-          setMessages(prev => [...prev, assistantMsg])
-        }
-        setStreamingContent('')
-        // 保留思考过程与参考来源，便于用户回看「问题拆解情况」
-        setThinkingSteps(prev => prev.map(s => ({ ...s, status: 'done' as const })))
-        setIsStreaming(false)
+          if (finalAnswer) {
+            // 把本次回答的引用/思考过程也挂到消息上（历史恢复与角标跳转依赖它）
+            const assistantMsg: Message = {
+              id: uuid(),
+              role: 'assistant',
+              content: finalAnswer,
+              citations: s.references.map(r => ({
+                source_name: r.sourceName,
+                source_url: r.url || '',
+                snippet: r.snippet || '',
+              })),
+              thinking_steps: s.thinkingSteps.map(t => t.label),
+              timestamp: new Date().toISOString(),
+            }
+            next = { ...next, messages: [...s.messages, assistantMsg] }
+          }
+          return next
+        })
       },
       onError: (errMsg) => {
-        setError(errMsg)
-        setThinkingSteps(prev =>
-          prev.map(s => s.status === 'active' ? { ...s, status: 'error' as const } : s)
-        )
-        setIsStreaming(false)
+        applyConvState(convId, s => ({
+          ...s,
+          error: errMsg,
+          thinkingSteps: s.thinkingSteps.map(t => t.status === 'active' ? { ...t, status: 'error' as const } : t),
+          isStreaming: false,
+        }))
       },
-    })
-  }, [onUpdate])   // conversation 通过 conversationRef 读取，不依赖 props
+    }, threadId)
+  }, [onUpdate, applyConvState])   // conversation 通过 conversationRef 读取，不依赖 props
 
   const handleStop = useCallback(() => {
-    abortActiveRequest()
-    if (streamingContent) {
-      const partialMsg: Message = {
-        id: crypto.randomUUID(),
-        role: 'assistant',
-        content: streamingContent + '\n\n*[已中断]*',
-        timestamp: new Date().toISOString(),
+    const conv = conversationRef.current
+    const convId = conv?.id
+    // 只中断当前会话的请求，不影响其他会话正在进行的问答
+    if (conv?.thread_id) abortActiveRequest(conv.thread_id)
+    applyConvState(convId, s => {
+      let next = {
+        ...s,
+        isStreaming: false,
+        streamingContent: '',
+        thinkingSteps: [],
+        references: [],
+        error: null,
       }
-      setMessages(prev => [...prev, partialMsg])
-    }
-    setStreamingContent('')
-    setThinkingSteps([])
-    setReferences([])
-    setError(null)
-    setIsStreaming(false)
-  }, [streamingContent])
+      if (s.streamingContent) {
+        const partialMsg: Message = {
+          id: uuid(),
+          role: 'assistant',
+          content: s.streamingContent + '\n\n*[已中断]*',
+          timestamp: new Date().toISOString(),
+        }
+        next = { ...next, messages: [...s.messages, partialMsg] }
+      }
+      return next
+    })
+  }, [applyConvState])
 
   const hasStream = streamingContent.length > 0
 
@@ -359,7 +482,7 @@ export const ChatContainer: FC<ChatContainerProps> = ({
 
           {/* 参考来源（可折叠） */}
           {references.length > 0 && (
-            <details className="reference-details group">
+            <details className="reference-details group" id="reference-panel">
               <summary className="text-xs font-medium text-[#8b949e] flex items-center gap-1.5 cursor-pointer hover:text-[#e6edf3] select-none py-0.5">
                 <svg className="w-3 h-3 transition-transform group-open:rotate-90" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                   <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />

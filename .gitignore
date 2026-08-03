@@ -39,6 +39,19 @@ Thumbs.db
 
 # ===== 临时调试 / 测试脚本与产物（非源码）=====
 backend/_*.py
+backend/_*.txt
 backend/e2e_*.json
 backend/lookup_*.json
 backend/lookup_test.json
+backend/backend_err.txt
+backend/backend_log.txt
+
+# ===== ChEMBL MCP Server（第三方构建产物，非本项目源码）=====
+backend/mcp/
+
+# ===== deploy 临时诊断脚本 =====
+deploy/_*.py
+deploy/_*.out
+
+# ===== WorkBuddy 记忆数据 =====
+.workbuddy/

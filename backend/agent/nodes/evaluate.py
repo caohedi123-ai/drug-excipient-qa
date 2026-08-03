@@ -10,6 +10,8 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from agent.state import AgentState
 from config import get_settings
+from agent.nodes.context_budget import allocate_per_source_chars, truncate_with_ellipsis
+from agent.nodes.history_utils import smart_truncate
 
 settings = get_settings()
 
@@ -73,18 +75,23 @@ def run_evaluate(state: AgentState) -> dict:
     # 规则质量分
     content_quality = _calc_content_quality(state)
 
-    # 注入对话历史上下文（用于追问场景的评估）
+    # 注入对话历史上下文（用于追问场景的评估，智能截断保护数值/实体）
     history_ctx = ""
     if len(messages) > 1:
-        recent = messages[-2:]
+        recent = messages[-2 * max(settings.history_inject_rounds, 1):]
         history_ctx = "\n对话历史（注意用户是追问）:\n" + "\n".join(
-            f"{'用户' if getattr(m, 'type', None) == 'human' else '助手'}: {str(getattr(m, 'content', m))[:200]}"
+            f"{'用户' if getattr(m, 'type', None) == 'human' else '助手'}: {smart_truncate(str(getattr(m, 'content', m)), settings.history_smart_truncate_chars)}"
             for m in recent
         )
 
-    # 构造检索结果文本（前3000字符，确保LLM能看到完整内容）
+    # 构造检索结果文本（动态预算：按源数分配，单源≤上限、总量≤预算）
+    per_source = allocate_per_source_chars(
+        len(retrieval_results),
+        settings.retrieval_max_total_chars,
+        settings.retrieval_max_chars_per_source,
+    )
     results_text = "\n\n".join(
-        f"[{r.get('source_name', '?')}]\n{r.get('content', '')[:3000]}"
+        f"[{r.get('source_name', '?')}]\n{truncate_with_ellipsis(r.get('content', ''), per_source)}"
         for r in retrieval_results
     )
 
@@ -103,7 +110,7 @@ def run_evaluate(state: AgentState) -> dict:
         f"当前检索源数量: {len(retrieval_results)}\n"
         f"规则质量分: {content_quality:.2f} (仅供参考，不作为主要判断依据)\n"
         f"{missing_context}\n"
-        f"检索结果（前3000字符/源）:\n{results_text}"
+        f"检索结果（动态预算，单源≤{settings.retrieval_max_chars_per_source}字符/源）:\n{results_text}"
     )
     if history_ctx:
         human_text = history_ctx + "\n\n" + human_text
@@ -256,18 +263,34 @@ def run_synthesize(state: AgentState) -> dict:
     low_confidence = state.get("low_confidence", False)
     intent = state.get("intent", "") or "未指定"
 
-    # 注入对话历史（帮助追问时保持一致性）
+    # 注入对话历史（帮助追问时保持一致性，智能截断保护数值/实体；
+    # 跳过已压缩最旧消息，附加会话摘要与实体记忆）
     history_ctx = ""
-    if len(messages) > 1:
-        recent = messages[-4:]  # 最近 2 轮
-        history_ctx = "\n对话历史:\n" + "\n".join(
-            f"{'用户' if getattr(m,'type',None)=='human' else '助手'}: {str(getattr(m,'content',m))[:200]}"
-            for m in recent
-        )
+    summary_rounds = state.get("summary_rounds", 0) or 0
+    session_summary = state.get("session_summary", "") or ""
+    entity_memory = state.get("entity_memory", {}) or {}
+    available = messages[2 * summary_rounds:] if 2 * summary_rounds < len(messages) else messages
+    history_parts = []
+    if session_summary:
+        history_parts.append(f"[会话摘要]\n{session_summary[:1200]}")
+    if len(available) > 1:
+        recent = available[-2 * max(settings.history_inject_rounds, 1):]  # 最近 N 轮
+        for m in recent:
+            role = "用户" if getattr(m, "type", None) == "human" else "助手"
+            history_parts.append(
+                f"{role}: {smart_truncate(str(getattr(m,'content',m)), settings.history_smart_truncate_chars)}"
+            )
+    if history_parts:
+        history_ctx = "\n对话历史:\n" + "\n".join(history_parts)
 
-    # 构造检索结果文本
+    # 构造检索结果文本（动态预算：按源数分配，单源≤上限、总量≤预算）
+    per_source = allocate_per_source_chars(
+        len(retrieval_results),
+        settings.retrieval_max_total_chars,
+        settings.retrieval_max_chars_per_source,
+    )
     results_text = "\n\n".join(
-        f"--- {r.get('source_name', '?')} ---\n{r.get('content', '')[:2000]}"
+        f"--- {r.get('source_name', '?')} ---\n{truncate_with_ellipsis(r.get('content', ''), per_source)}"
         for r in retrieval_results
     )
 

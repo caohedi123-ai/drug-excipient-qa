@@ -89,6 +89,48 @@ PHASE1_TOOLS = ALL_TOOLS
 TOOLS_BY_NAME = {t.name: t for t in ALL_TOOLS}
 
 
+# 数据源类型标注（P0.1/P1.1 披露纠偏）：向 LLM 披露每个工具的权威度与数据成色
+# "[官方API]" = 直连权威数据库 REST API（数据一手可信）；
+# "[网络检索]" = 经 Tavily/AnySearch 域名或垂直搜索（非官方 API，成色较低仅供参考）；
+# "[综合检索]" = 官方 API + 网络检索混合编排的速查聚合。
+SOURCE_TYPE = {
+    # 官方 API（一手权威数据）
+    "pubchem_tool": "[官方API]",
+    "drugcentral_tool": "[官方API]",
+    "coconut_tool": "[官方API]",
+    "fda_iig_tool": "[官方API]",
+    "fda_unii_tool": "[官方API]",
+    "fda_ndc_tool": "[官方API]",
+    "dailymed_tool": "[官方API]",
+    "fda_orange_tool": "[官方API]",
+    "fda_drugs_tool": "[官方API]",
+    "fda_faers_tool": "[官方API]",
+    "rxnorm_tool": "[官方API]",
+    "pubmed_tool": "[官方API]",
+    "clinicaltrials_tool": "[官方API]",
+    "open_targets_tool": "[官方API]",
+    "chembl_tool": "[官方API]",
+    # 网络检索兜底（非官方 API，成色较低）
+    "wikipedia_tool": "[网络检索]",
+    "drugbank_tool": "[网络检索]",
+    "ema_tool": "[网络检索]",
+    "cde_tool": "[网络检索]",
+    "pmda_tool": "[网络检索]",
+    "sider_tool": "[网络检索]",
+    "ddinter_tool": "[网络检索]",
+    "bindingdb_tool": "[网络检索]",
+    "pharmgkb_tool": "[网络检索]",
+    "ttd_tool": "[网络检索]",
+    "who_atc_tool": "[网络检索]",
+    "ich_tool": "[网络检索]",
+    "espacenet_tool": "[网络检索]",
+    "cnipa_tool": "[网络检索]",
+    "anysearch_fallback_tool": "[网络检索]",
+    # 综合速查（官方 API + 网络检索混合）
+    "excipient_basic_info_tool": "[综合检索]",
+}
+
+
 def get_tool_node():
     """获取注册了所有工具的 ToolNode（延迟导入避免重型依赖初始化）"""
     from langgraph.prebuilt import ToolNode
@@ -96,13 +138,21 @@ def get_tool_node():
 
 
 def get_tool_descriptions() -> str:
-    """生成工具列表描述文本（供 LLM 的 system prompt 使用），动态覆盖全部工具"""
+    """生成工具列表描述文本（供 LLM 的 system prompt 使用），动态覆盖全部工具。
+    P0.1/P1.1 披露纠偏：为每个工具前缀 [官方API]/[网络检索]/[综合检索] 标签，
+    让 LLM 区分一手权威数据与联网检索兜底，避免对泛搜源过度信任。"""
     lines = [
         "## 可用数据源工具",
-        "（优先使用有 API 覆盖的专有源；若所选源均返回空或不足，务必加入 "
+        "**标签说明**：[官方API]=直连权威数据库（一手可信）；[网络检索]=联网搜索兜底（非官方、仅供参考）；"
+        "[综合检索]=官方API+网络检索混合编排。",
+        "（优先使用有 [官方API] 覆盖的专有源；若所选源均返回空或不足，务必加入 "
         "**anysearch_fallback_tool** 做全网泛搜兜底，确保最终有答案而非'未找到'）\n",
     ]
     for t in ALL_TOOLS:
         desc = (t.description or "").strip()
-        lines.append(f"- **{t.name}**: {desc}")
+        tag = SOURCE_TYPE.get(t.name, "")
+        if tag:
+            lines.append(f"- **{t.name}** {tag}: {desc}")
+        else:
+            lines.append(f"- **{t.name}**: {desc}")
     return "\n".join(lines)

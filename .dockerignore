@@ -1,0 +1,39 @@
+# ============================================================
+# Docker 构建上下文排除规则（部署用）
+# 只保留后端源码与前端构建产物，剔除冗余文件，减小镜像体积
+# ============================================================
+
+# 版本控制
+.git
+.gitignore
+
+# Python 缓存 / 虚拟环境
+**/__pycache__
+**/*.py[cod]
+**/.venv
+**/venv
+*.egg-info
+.pytest_cache
+
+# 密钥与环境变量（绝不入镜像！部署时通过 deploy/.env 注入）
+**/.env
+**/.env.*
+!**/.env.example
+
+# 日志与临时产物
+**/*.log
+**/*.err
+backend/_*.py
+backend/_*.txt
+backend/e2e_*.json
+backend/lookup_*.json
+qc
+$null
+
+# 前端源码不需要进后端镜像（dist 由 nginx 直接挂载）
+frontend/
+deploy/
+
+# IDE
+.idea
+.vscode

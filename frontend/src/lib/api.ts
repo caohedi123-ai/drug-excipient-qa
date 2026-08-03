@@ -195,36 +195,50 @@ export interface ChatCallbacks {
   onError?: (errorMsg: string) => void
 }
 
-// 用 AbortController 支持「停止」；单请求串行，简化状态管理
-let activeController: AbortController | null = null
+// ── 流式问答请求管理（按会话隔离，支持多会话/多设备并行）──
+// 用 Map<requestKey, AbortController> 替代单一全局 controller：
+// 不同会话（不同 thread_id）的请求互不干扰；同一会话内新请求会中断旧请求（会话内串行语义）。
+const controllers = new Map<string, AbortController>()
 
-export function isRequestActive(): boolean {
-  return activeController !== null
+export function isRequestActive(requestKey?: string): boolean {
+  return !!requestKey && controllers.has(requestKey)
 }
 
-export function abortActiveRequest(): void {
-  if (activeController) {
-    activeController.abort()
-    activeController = null
+export function abortActiveRequest(requestKey?: string): void {
+  if (requestKey) {
+    controllers.get(requestKey)?.abort()
+    return
   }
+  // 兼容旧的无参调用：中止所有进行中的请求。
+  // 注意：不要 clear map——否则被中止的请求会因 isStale() 静默退出，
+  // 上层收尾（onDone(undefined)/isStreaming 复位）将悬挂。保留 entry，
+  // 让每个请求走 AbortError 路径自行 onDone 并在 finally 中清理自己。
+  for (const c of controllers.values()) c.abort()
 }
 
 /**
  * 向真实后端发起 SSE 流式问答请求。
  * 后端：POST /api/chat { query, conversation_id, thread_id }
  * 推送：thinking / answer / error / [DONE]
+ * @param requestKey 请求隔离键（前端传 thread_id）。同 key 的旧请求会被中断（会话内串行）；
+ *   不同 key 的请求并行进行，互不干扰，终止后各回各自的会话。
  */
 export async function sendChatMessage(
   query: string,
   threadId: string | null,
   callbacks: ChatCallbacks,
+  requestKey?: string | null,
 ): Promise<void> {
-  // 若上一次请求仍在进行，先中断（保证串行）
-  if (activeController) {
-    activeController.abort()
-  }
+  const key = requestKey || threadId || query
+
+  // 同一会话的旧请求仍在进行 → 中断它（会话内串行；跨会话不干预）
+  const prev = controllers.get(key)
+  if (prev) prev.abort()
+
   const controller = new AbortController()
-  activeController = controller
+  controllers.set(key, controller)
+  // 被同 key 新请求顶替后为 true：静默结束，不再触发任何回调（避免旧请求改写会话终态）
+  const isStale = () => controllers.get(key) !== controller
 
   try {
     const res = await authFetch(`${BASE_URL}/api/chat`, {
@@ -251,8 +265,10 @@ export async function sendChatMessage(
     const decoder = new TextDecoder()
     let buffer = ''
     let finalAnswer = ''
+    let hasError = false
 
     while (true) {
+      if (isStale()) return  // 已被同会话新请求顶替：静默退出
       const { done, value } = await reader.read()
       if (done) break
       buffer += decoder.decode(value, { stream: true })
@@ -294,22 +310,30 @@ export async function sendChatMessage(
           }
           if (delta) callbacks.onToken?.(delta)
         } else if (evt.type === 'error') {
+          hasError = true
           callbacks.onError?.(evt.message || '处理出错')
+          break  // 出错后终止本次流，避免继续触发回调
         }
       }
+      if (hasError) break
     }
 
-    callbacks.onDone?.(finalAnswer || undefined)
+    if (!hasError) callbacks.onDone?.(finalAnswer || undefined)
   } catch (err: any) {
+    if (isStale()) {
+      // 被同会话新请求顶替：静默退出，不影响新请求
+      return
+    }
     if (err?.name === 'AbortError') {
-      // 用户主动停止，正常结束
+      // 用户主动停止，正常结束（onDone(undefined)，由上层做收尾）
       callbacks.onDone?.(undefined)
     } else {
       callbacks.onError?.(err?.message || '请求失败，请检查后端服务是否运行')
     }
   } finally {
-    if (activeController === controller) {
-      activeController = null
+    // 仅当仍是本请求自己的 entry 时才清理，避免误删同 key 新请求
+    if (controllers.get(key) === controller) {
+      controllers.delete(key)
     }
   }
 }
