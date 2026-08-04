@@ -6,6 +6,7 @@ import { MessageBubble } from './MessageBubble'
 import { ThinkingProcess } from './ThinkingProcess'
 import { ReferenceList } from './ReferenceList'
 import DataSourcePanel from './DataSourcePanel'
+import TierSelector, { loadSavedTier, type TierId } from './TierSelector'
 import { sendChatMessage, abortActiveRequest, fetchConversationMessages } from '../lib/api'
 import { uuid } from '../lib/uuid'
 import type { Conversation, Message } from '../types'
@@ -52,6 +53,7 @@ export const ChatContainer: FC<ChatContainerProps> = ({
   const [error, setError] = useState<string | null>(null)
   const [isStreaming, setIsStreaming] = useState(false)
   const [loadingHistory, setLoadingHistory] = useState(false)
+  const [tier, setTier] = useState<TierId>(loadSavedTier)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const lastConvIdRef = useRef<string | null>(null)
   const skipAutoScrollRef = useRef(false)
@@ -143,8 +145,9 @@ export const ChatContainer: FC<ChatContainerProps> = ({
         setIsStreaming(saved.isStreaming)
       } else {
         // 未缓存 —— 从后端加载历史消息
-        // 若本地已有消息（如刚发起提问的新会话），不得清空覆盖
-        const hasLocal = msgsRef.current.length > 0
+        // 修复：仅当「此前无旧会话」且本地确有消息（首屏直接提问创建）时才保留，
+        // 否则 msgsRef 中是旧会话残留，必须清空，避免切新问答后残留历史内容
+        const hasLocal = oldId === null && msgsRef.current.length > 0
         if (!hasLocal) {
           setMessages([])
           setStreamingContent('')
@@ -230,6 +233,14 @@ export const ChatContainer: FC<ChatContainerProps> = ({
             if (conversationRef.current?.id === newId) setLoadingHistory(false)
           })
       }
+    } else {
+      // 无目标会话（删除当前会话等）→ 清空显示，避免删除后残留历史内容
+      setMessages([])
+      setStreamingContent('')
+      setThinkingSteps([])
+      setReferences([])
+      setError(null)
+      setIsStreaming(false)
     }
 
     lastConvIdRef.current = newId
@@ -367,8 +378,8 @@ export const ChatContainer: FC<ChatContainerProps> = ({
           isStreaming: false,
         }))
       },
-    }, threadId)
-  }, [onUpdate, applyConvState])   // conversation 通过 conversationRef 读取，不依赖 props
+    }, threadId, tier, convId)
+  }, [onUpdate, applyConvState, tier])   // conversation 通过 conversationRef 读取，不依赖 props
 
   const handleStop = useCallback(() => {
     const conv = conversationRef.current
@@ -508,6 +519,12 @@ export const ChatContainer: FC<ChatContainerProps> = ({
       {/* Input area */}
       <div className="border-t border-[#21262d] px-4 py-3 bg-[#0d1117]">
         <div className="max-w-3xl mx-auto">
+          <div className="mb-2 flex items-center gap-2">
+            <TierSelector value={tier} onChange={setTier} />
+            <span className="text-[11px] text-[#8b949e]">
+              {tier === 'custom' ? '使用系统设置中的自定义检索配置' : '检索档位：Flash 速度优先 → Pro 质量优先'}
+            </span>
+          </div>
           <ChatInput
             onSend={handleSend}
             disabled={isStreaming}

@@ -146,6 +146,15 @@ export async function fetchConversationMessages(conversationId: string): Promise
   return Array.isArray(data) ? data : (data.messages || [])
 }
 
+export async function renameConversation(conversationId: string, title: string): Promise<void> {
+  const res = await authFetch(`${BASE_URL}/api/conversations/${conversationId}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title }),
+  })
+  if (!res.ok) throw new Error(`重命名失败: ${res.status}`)
+}
+
 // ── 速查历史 ──
 export async function fetchLookupHistory(): Promise<any[]> {
   const res = await authFetch(`${BASE_URL}/api/lookup/history`)
@@ -153,9 +162,53 @@ export async function fetchLookupHistory(): Promise<any[]> {
   return res.json()
 }
 
+// ── 设置（API 密钥 / 检索参数）──
+export interface ApiKeySetting {
+  masked: string
+  configured: boolean
+}
+export interface SettingsData {
+  api_keys: {
+    deepseek_api_key: ApiKeySetting
+    tavily_api_key: ApiKeySetting
+    anysearch_api_key: ApiKeySetting
+  }
+  retrieval: Record<string, number>
+}
+
+export async function fetchSettings(): Promise<SettingsData> {
+  const res = await authFetch(`${BASE_URL}/api/settings`)
+  if (!res.ok) throw new Error(`获取设置失败: ${res.status}`)
+  return res.json()
+}
+
+export async function updateSettings(payload: {
+  deepseek_api_key?: string
+  tavily_api_key?: string
+  anysearch_api_key?: string
+  retrieval?: Record<string, number>
+}): Promise<SettingsData> {
+  const res = await authFetch(`${BASE_URL}/api/settings`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  if (!res.ok) throw new Error(`保存设置失败: ${res.status}`)
+  return res.json()
+}
+
 export async function deleteLookupHistory(id: string): Promise<void> {
   const res = await authFetch(`${BASE_URL}/api/lookup/history/${id}`, { method: 'DELETE' })
   if (!res.ok) throw new Error('删除失败')
+}
+
+export async function renameLookupHistory(id: string, title: string): Promise<void> {
+  const res = await authFetch(`${BASE_URL}/api/lookup/history/${id}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title }),
+  })
+  if (!res.ok) throw new Error(`重命名失败: ${res.status}`)
 }
 
 // 后端 SSE 事件类型（main.py 真实推送）
@@ -228,6 +281,8 @@ export async function sendChatMessage(
   threadId: string | null,
   callbacks: ChatCallbacks,
   requestKey?: string | null,
+  tier?: string,
+  conversationId?: string | null,
 ): Promise<void> {
   const key = requestKey || threadId || query
 
@@ -246,8 +301,10 @@ export async function sendChatMessage(
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         query,
-        conversation_id: null,
+        // 发送前端真实会话 id：否则后端每次生成新 UUID，导致历史记录/重命名无法对应（BUG-3 修复）
+        conversation_id: conversationId ?? null,
         thread_id: threadId,
+        tier: tier || 'pro',
       }),
       signal: controller.signal,
     })
@@ -267,55 +324,66 @@ export async function sendChatMessage(
     let finalAnswer = ''
     let hasError = false
 
+    // 统一分发单个 SSE 事件
+    const processEvt = (evt: ThinkingEvent | AnswerEvent | ErrorEvent) => {
+      if (evt.type === 'thinking') {
+        const steps = Array.isArray(evt.steps) ? evt.steps : []
+        callbacks.onStep?.({ steps, current: evt.description || '' })
+      } else if (evt.type === 'answer') {
+        // 后端按块增量推送，content 为增量片段，逐块累加
+        const delta = evt.content || ''
+        finalAnswer += delta
+        if (evt.citations?.length) {
+          callbacks.onSources?.(
+            evt.citations.map(c => ({
+              title: c.source_name,
+              snippet: c.snippet || '',
+              sourceUrl: c.source_url || '',
+              sourceName: c.source_name,
+            })),
+          )
+        }
+        if (delta) callbacks.onToken?.(delta)
+      } else if (evt.type === 'error') {
+        hasError = true
+        callbacks.onError?.(evt.message || '处理出错')
+      }
+    }
+
     while (true) {
       if (isStale()) return  // 已被同会话新请求顶替：静默退出
       const { done, value } = await reader.read()
       if (done) break
       buffer += decoder.decode(value, { stream: true })
 
-      // SSE 以空行分隔事件
-      const events = buffer.split('\n\n')
-      buffer = events.pop() ?? ''
+      // 按行解析 SSE：每个 `data:` 行都是自包含事件，对 TCP 分片恰好切在
+      // 事件分隔符(\n\n)处更健壮，避免一次分片丢失多个事件。
+      const lines = buffer.split('\n')
+      buffer = lines.pop() ?? ''   // 保留最后一个可能未完成的行
 
-      for (const raw of events) {
-        const line = raw.trim()
+      for (const rawLine of lines) {
+        const line = rawLine.trim()
         if (!line.startsWith('data:')) continue
-        let payload = line.slice(5).trim()
-        if (payload === '[DONE]') continue
-
-        let evt: ThinkingEvent | AnswerEvent | ErrorEvent
+        const payload = line.slice(5).trim()
+        if (!payload || payload === '[DONE]') continue
         try {
-          evt = JSON.parse(payload)
+          processEvt(JSON.parse(payload))
         } catch {
           continue
         }
-
-        if (evt.type === 'thinking') {
-          const steps = Array.isArray(evt.steps) ? evt.steps : []
-          const current = evt.description || ''
-          callbacks.onStep?.({ steps, current })
-        } else if (evt.type === 'answer') {
-          // 后端按块增量推送，content 为增量片段，逐块累加
-          const delta = evt.content || ''
-          finalAnswer += delta
-          if (evt.citations?.length) {
-            callbacks.onSources?.(
-              evt.citations.map(c => ({
-                title: c.source_name,
-                snippet: c.snippet || '',
-                sourceUrl: c.source_url || '',
-                sourceName: c.source_name,
-              })),
-            )
-          }
-          if (delta) callbacks.onToken?.(delta)
-        } else if (evt.type === 'error') {
-          hasError = true
-          callbacks.onError?.(evt.message || '处理出错')
-          break  // 出错后终止本次流，避免继续触发回调
-        }
       }
       if (hasError) break
+    }
+
+    // 流结束后冲刷残留缓冲（最后一个事件可能缺少结尾换行）
+    if (!hasError && buffer.trim()) {
+      const line = buffer.trim()
+      if (line.startsWith('data:')) {
+        const payload = line.slice(5).trim()
+        if (payload && payload !== '[DONE]') {
+          try { processEvt(JSON.parse(payload)) } catch { /* 不完整分片，忽略 */ }
+        }
+      }
     }
 
     if (!hasError) callbacks.onDone?.(finalAnswer || undefined)

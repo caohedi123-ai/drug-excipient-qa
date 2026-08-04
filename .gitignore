@@ -13,6 +13,7 @@ venv/
 .env
 *.env
 .env.*
+backend/user_settings.json
 
 # ===== 运行日志 / 错误输出 =====
 *.log
@@ -55,3 +56,11 @@ deploy/_*.out
 
 # ===== WorkBuddy 记忆数据 =====
 .workbuddy/
+
+# ===== 运行输出 / 进程 PID 文件（临时产物，不入库）=====
+*_out.txt
+*_err.txt
+*_pid.txt
+dbg_*.txt
+e2e_*.txt
+backend/e2e_v3_tail.py

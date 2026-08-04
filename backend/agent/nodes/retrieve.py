@@ -10,6 +10,7 @@ from agent.state import AgentState, Citation, SearchResult
 from tools import TOOLS_BY_NAME
 from tools.engines import anysearch_engine
 from config import get_settings
+from agent.runtime_cfg import get_param
 from agent.nodes.context_budget import truncate_with_ellipsis
 
 settings = get_settings()
@@ -104,7 +105,7 @@ async def _run_retrieve_async(state: AgentState) -> dict:
 
         all_results.append({
             "source_name": tool_name,
-            "content": truncate_with_ellipsis(content_part, settings.retrieval_max_store_chars),
+            "content": truncate_with_ellipsis(content_part, get_param("retrieval_max_store_chars", settings.retrieval_max_store_chars)),
             "citations": tool_citations,
             "success": real_success,
             "failure": (not real_success),
@@ -128,7 +129,7 @@ async def _run_retrieve_async(state: AgentState) -> dict:
                     new_citations.append(tc)
                 all_results.append({
                     "source_name": "anysearch_fallback",
-                    "content": truncate_with_ellipsis(fb.content, settings.retrieval_max_store_chars),
+                    "content": truncate_with_ellipsis(fb.content, get_param("retrieval_max_store_chars", settings.retrieval_max_store_chars)),
                     "citations": fb_citations,
                     "success": True,
                     "failure": False,

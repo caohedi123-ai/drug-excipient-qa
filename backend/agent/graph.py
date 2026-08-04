@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from langgraph.graph import StateGraph, END
 from agent.state import AgentState
 from config import get_settings
+from agent.runtime_cfg import get_param
 
 settings = get_settings()
 
@@ -93,7 +94,7 @@ def _maybe_compress_history(state: AgentState, result: dict) -> dict:
     if not messages:
         return result
     compressed_this_round = state.get("compressed_this_round", False)
-    if not should_compress(len(messages), settings.history_compress_rounds, compressed_this_round):
+    if not should_compress(len(messages), get_param("history_compress_rounds", settings.history_compress_rounds), compressed_this_round):
         return result
 
     summary = state.get("session_summary", "") or ""

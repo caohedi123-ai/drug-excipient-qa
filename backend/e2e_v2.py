@@ -1,5 +1,10 @@
 """E2E v2: 改造后全链路验证 — 重点测试实体记忆+中断+新图拓扑"""
-import asyncio, json, httpx, time
+import asyncio, json, httpx, sys, time
+
+# Windows 重定向 stdout 默认 GBK，无法编码 ® 等字符，强制 UTF-8
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 BASE = "http://127.0.0.1:18082"
 results = []
@@ -28,6 +33,17 @@ async def sse_chat(query, conv_id=None, thread_id=None, timeout=300):
                                 except: pass
     return events
 
+def aggregate_answers(events):
+    """聚合所有 answer 事件：合并内容、收集 citations（后端仅最后一片携带引用）。"""
+    ans_events = [e for e in events if e.get("type") == "answer"]
+    content = "".join(e.get("content", "") for e in ans_events)
+    citations = [c for e in ans_events for c in (e.get("citations") or [])]
+    conv_id = next((e.get("conversation_id") for e in ans_events if e.get("conversation_id")), None)
+    thread_id = next((e.get("thread_id") for e in ans_events if e.get("thread_id")), None)
+    return {"content": content, "citations": citations,
+            "conversation_id": conv_id, "thread_id": thread_id,
+            "events": ans_events}
+
 async def main():
     print("="*60)
     print("E2E v2: 改造后全链路验证")
@@ -36,28 +52,30 @@ async def main():
     # [1] 基础功能
     print("\n[1] 基础检索: aspirin molecular weight")
     e1 = await sse_chat("aspirin molecular weight")
-    ans = next((e for e in e1 if e.get("type")=="answer"), None)
+    agg1 = aggregate_answers(e1)
+    ans = agg1["events"][0] if agg1["events"] else None
     check("Answer event", ans is not None)
-    check("Has MW", "180" in (ans.get("content","") if ans else ""))
+    check("Has MW", "180" in agg1["content"])
     check("[DONE]", any(e.get("type")=="[DONE]" for e in e1))
-    check("Has citations", len(ans.get("citations",[]))>0 if ans else False)
+    check("Has citations", len(agg1["citations"])>0, f"answer_events={len(agg1['events'])}, citations={len(agg1['citations'])}")
 
     # [2] 追问：实体记忆测试（阿可替尼 → 追问）
     print("\n[2] 实体记忆: acalabrutinib → follow-up dosage")
     e2a = await sse_chat("what is acalabrutinib", conv_id=None, thread_id=None)
-    ans2a = next((e for e in e2a if e.get("type")=="answer"), None)
+    agg2a = aggregate_answers(e2a)
+    ans2a = agg2a["events"][0] if agg2a["events"] else None
     check("acalabrutinib answered", ans2a is not None)
-    has_acalabrutinib = ans2a and ("acalabrutinib" in (ans2a.get("content","")).lower() or "calquence" in (ans2a.get("content","")).lower())
+    content2a = agg2a["content"].lower()
+    has_acalabrutinib = "acalabrutinib" in content2a or "calquence" in content2a
     check("Content about acalabrutinib", has_acalabrutinib)
-    cid1 = ans2a.get("conversation_id") if ans2a else None
-    tid1 = ans2a.get("thread_id") if ans2a else None
+    cid1 = agg2a["conversation_id"]
+    tid1 = agg2a["thread_id"]
     check("UUID returned", bool(cid1) and bool(tid1))
 
     # 追问：那它的用法用量？
     print("\n  追问: what about its dosage...")
     e2b = await sse_chat("what about its dosage and administration", conv_id=cid1, thread_id=tid1)
-    ans2b = next((e for e in e2b if e.get("type")=="answer"), None)
-    content2b = ans2b.get("content","").lower() if ans2b else ""
+    content2b = aggregate_answers(e2b)["content"].lower()
     
     # 关键验证：追问回答应跟踪正确实体（不串药），有剂量信息或如实说明未找到
     not_aspirin = "aspirin" not in content2b
@@ -74,31 +92,31 @@ async def main():
     # [2.5] 中文追问：阿可替尼 → 那它的用法用量呢？（原 bug 场景）
     print("\n[2.5] 中文实体记忆: 阿可替尼 → 那它的用法用量呢")
     e25a = await sse_chat("阿可替尼是什么药", conv_id=None, thread_id=None)
-    ans25a = next((e for e in e25a if e.get("type")=="answer"), None)
+    agg25a = aggregate_answers(e25a)
+    ans25a = agg25a["events"][0] if agg25a["events"] else None
     check("阿可替尼 answered", ans25a is not None)
-    content25a = ans25a.get("content","").lower() if ans25a else ""
-    cid25 = ans25a.get("conversation_id") if ans25a else None
-    tid25 = ans25a.get("thread_id") if ans25a else None
+    content25a = agg25a["content"].lower()
+    cid25 = agg25a["conversation_id"]
+    tid25 = agg25a["thread_id"]
     check("阿可替尼 UUID returned", bool(cid25) and bool(tid25))
 
     print("  追问: 那它的用法用量呢...")
     e25b = await sse_chat("那它的用法用量呢", conv_id=cid25, thread_id=tid25)
-    ans25b = next((e for e in e25b if e.get("type")=="answer"), None)
-    content25b = ans25b.get("content","").lower() if ans25b else ""
+    content25b = aggregate_answers(e25b)["content"].lower()
     # 关键验证：不能窜药，不能识别成阿司匹林
     chinese_entity_fail = "阿司匹林" in content25b or "aspirin" in content25b
     chinese_has_dosage = any(w in content25b for w in ["剂量","用法","用量","mg","每日","口服","给药","administration","dosage","dose"])
     check("中文追问: NOT 阿司匹林", not chinese_entity_fail,
           f"contains_aspirin={chinese_entity_fail}")
     check("中文追问: has dosage info", chinese_has_dosage,
-          f"content preview: {(ans25b.get('content','') if ans25b else '')[:200]}")
+          f"content preview: {content25b[:200]}")
 
     # [3] 对话隔离：新对话应有独立实体
     print("\n[3] 异实体: ibuprofen molecular weight (new conv)")
     e3 = await sse_chat("ibuprofen molecular weight", conv_id=None, thread_id=None)
-    ans3 = next((e for e in e3 if e.get("type")=="answer"), None)
-    cid3 = ans3.get("conversation_id") if ans3 else None
-    content3 = ans3.get("content","").lower() if ans3 else ""
+    agg3 = aggregate_answers(e3)
+    cid3 = agg3["conversation_id"]
+    content3 = agg3["content"].lower()
     is_ibuprofen = "ibuprofen" in content3 and "206" in content3
     check("About ibuprofen", is_ibuprofen)
     check("Different UUID", cid3 != cid1, f"c1={cid1}, c3={cid3}")

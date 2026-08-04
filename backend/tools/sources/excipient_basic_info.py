@@ -222,8 +222,8 @@ EXCIPIENT_KEYWORDS = {
     "sodium starch glycolate", "colloidal silicon", "carboxymethyl",
 }
 
-TIMEOUT_PER_SOURCE = 25          # 单源超时
-TIMEOUT_TOTAL = 60               # 整体超时（错误隔离硬上限）
+TIMEOUT_PER_SOURCE = 18          # 单源超时（全并发后最坏 gather ≈ 18s，不再两批 25s 排队）
+TIMEOUT_TOTAL = 70               # 整体超时（错误隔离硬上限）
 # 已知慢源定制更短超时（大文件/低稳定性接口挂起是 60s 预算被拖垮的主因）
 _SLOW_SOURCE_TIMEOUT = {
     "dailymed": 12,     # FDA 大标签 API 经常 30s+ 无响应，12s 截断不影响其他源
@@ -278,13 +278,13 @@ async def _expand_keywords(query: str) -> dict:
             "}\n\n"
             "只返回 JSON，不要其他内容。如果不确定某个字段，填空字符串或空数组。"
         )
-        # LLM 慢响应会挤占 60s 总预算，加 12s 硬超时，失败回退原文解析
+        # LLM 慢响应会挤占 70s 总预算，加 10s 硬超时，失败回退原文解析
         resp = await asyncio.wait_for(
             llm.ainvoke([
                 SystemMessage(content=system),
                 HumanMessage(content=f"产品名称：{query}"),
             ]),
-            timeout=12,
+            timeout=10,
         )
         content = resp.content if isinstance(resp.content, str) else str(resp.content)
         m = re.search(r"\{[\s\S]*\}", content)
@@ -329,7 +329,7 @@ async def _pubchem_resolve(name: str) -> tuple[Optional[str], Optional[str]]:
     if not name or len(name.strip()) < 2:
         return None, None
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=12) as client:
             # 一次请求同时拿 CID 与同义词（含 CAS），避免裸 /JSON 端点不稳定
             r = await client.get(
                 f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{name}/synonyms/JSON"
@@ -361,7 +361,7 @@ async def _verify_cas(cas: str) -> bool:
     if not cas or len(cas) < 5 or not CAS_RE.match(cas):
         return False
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=12) as client:
             r = await client.get(
                 f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{cas}/JSON"
             )
@@ -1393,7 +1393,7 @@ async def _aggregate(primary: str, product_type: str, entity_info: dict) -> str:
     except Exception:
         pat_task = None
 
-    sem = asyncio.Semaphore(8)
+    sem = asyncio.Semaphore(24)  # 全并发：17 源一次性并行，消除两批 25s 排队（gather 最坏从 ~50s 降至 ~18s）
     tasks = [_call_source(name, SOURCE_FUNCS[name], primary, sem) for name in sources]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     valid = [(n, r) for n, r in zip(sources, results)
@@ -1403,7 +1403,9 @@ async def _aggregate(primary: str, product_type: str, entity_info: dict) -> str:
     # 全失败兜底
     if not valid:
         try:
-            fb = await asyncio.to_thread(anysearch_engine.anysearch_vertical, primary, domain="health", max_results=8)
+            fb = await asyncio.wait_for(
+                asyncio.to_thread(anysearch_engine.anysearch_vertical, primary, domain="health", max_results=8),
+                timeout=10)
             if "No results" not in getattr(fb, "content", ""):
                 fb_c = [c.to_dict() if hasattr(c, "to_dict") else dict(c) for c in getattr(fb, "citations", [])]
                 return (f"__MODULES_JSON__: {json.dumps({'产品基本信息':{'fields':[],'text_parts':[fb.content]}}, ensure_ascii=False)}\n"
@@ -1560,12 +1562,23 @@ async def excipient_basic_info_tool(query: str) -> str:
             return await _aggregate(search_term, product_type, entity_info)
 
         return await asyncio.wait_for(_run(), timeout=TIMEOUT_TOTAL)
+    except asyncio.TimeoutError:
+        # 整体超时：TimeoutError 的 str() 为空串，必须给出明确提示（否则前端显示"发生异常：。"空消息）
+        import logging, traceback
+        logger = logging.getLogger(__name__)
+        logger.error(f"[excipient_basic_info] 查询「{query}」超时（>{TIMEOUT_TOTAL}s 预算耗尽）\n{traceback.format_exc()}")
+        return (
+            f"[原辅料基本信息速查] 查询「{query}」处理超时（超过 {TIMEOUT_TOTAL} 秒预算，外部数据源响应过慢）。"
+            "请稍后重试，或换用更简洁的查询词（如英文通用名 / CAS 号）。"
+            "（该子模块已隔离，不影响其他数据源与整体应答）\n\n__CITATIONS__: []"
+        )
     except Exception as e:
         # 错误隔离：任何异常都返回友好占位，不向上抛出，不影响其他工具
         import logging, traceback
         logger = logging.getLogger(__name__)
         logger.error(f"[excipient_basic_info] 查询「{query}」异常: {e}\n{traceback.format_exc()}")
+        err_txt = (str(e) or type(e).__name__).strip()
         return (
-            f"[原辅料基本信息速查] 查询「{query}」时发生异常：{e}。"
+            f"[原辅料基本信息速查] 查询「{query}」时发生异常：{err_txt}。"
             "（该子模块已隔离，不影响其他数据源与整体应答）\n\n__CITATIONS__: []"
         )

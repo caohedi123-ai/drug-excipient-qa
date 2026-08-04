@@ -9,6 +9,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from agent.state import AgentState
 from config import get_settings
+from agent.runtime_cfg import get_param
 from agent.nodes.history_utils import (
     smart_truncate,
     update_entity_memory,
@@ -123,14 +124,14 @@ def run_understand(state: AgentState) -> dict:
     skip = 2 * summary_rounds  # 已压缩的早期消息条数（注入时跳过）
     available = messages[skip:] if skip < len(messages) else messages
     if len(available) > 1:
-        inject_rounds = max(settings.history_inject_rounds, 1)
+        inject_rounds = max(get_param("history_inject_rounds", settings.history_inject_rounds), 1)
         recent = available[-2 * inject_rounds:]  # 最近 N 轮（每轮 user+assistant）
         history_parts = []
         for m in recent:
             role, content = _format_msg(m)
             # 智能截断长回答（保留数值/实体、词边界不切断），避免截掉关键信息
             if role == "助手":
-                content = smart_truncate(content, settings.history_smart_truncate_chars)
+                content = smart_truncate(content, get_param("history_smart_truncate_chars", settings.history_smart_truncate_chars))
             history_parts.append(f"{role}: {content}")
         history_text = "\n".join(history_parts)
 
@@ -140,7 +141,7 @@ def run_understand(state: AgentState) -> dict:
         history_text = (history_text + "\n" + entity_ctx).strip()
 
     # 历史总预算钳制（优先保留最近内容）
-    history_text = apply_total_budget(history_text, settings.history_max_total_chars)
+    history_text = apply_total_budget(history_text, get_param("history_max_total_chars", settings.history_max_total_chars))
 
     query_text = f"对话历史:\n{history_text}\n\n当前问题: {user_query}" if history_text else user_query
 

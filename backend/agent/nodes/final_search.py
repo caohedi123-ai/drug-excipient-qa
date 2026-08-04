@@ -11,6 +11,7 @@ import re
 
 from agent.state import AgentState
 from config import get_settings
+from agent.runtime_cfg import get_param
 from agent.nodes.context_budget import truncate_with_ellipsis
 
 settings = get_settings()
@@ -113,7 +114,7 @@ def run_final_search(state: AgentState) -> dict:
             has_citations = bool(r and r.citations)
             added_results.append({
                 "source_name": "anysearch_fallback",
-                "content": truncate_with_ellipsis(r.content, settings.retrieval_max_store_chars),
+                "content": truncate_with_ellipsis(r.content, get_param("retrieval_max_store_chars", settings.retrieval_max_store_chars)),
                 "citations": [c.to_dict() for c in r.citations] if r else [],
                 "success": has_citations,
                 "failure": not has_citations,

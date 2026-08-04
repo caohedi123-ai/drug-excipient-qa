@@ -39,7 +39,13 @@ FIXED_PASSWORD_HASH = hashlib.sha256(os.environ.get("ADMIN_PASSWORD", "admin@202
 
 # ── 认证依赖 ──
 async def requires_auth(authorization: str = Header(None)):
-    """JWT Bearer Token 验证中间件依赖。"""
+    """JWT Bearer Token 验证中间件依赖。
+
+    开发/测试环境可经环境变量 AUTH_DISABLED=1 关闭鉴权（仅用于本地 E2E/调试，
+    生产环境默认不设置该变量，鉴权始终开启）。
+    """
+    if os.environ.get("AUTH_DISABLED") == "1":
+        return "dev"
     if not authorization:
         raise HTTPException(status_code=401, detail="请先登录")
     try:
@@ -78,6 +84,8 @@ class ChatRequest(BaseModel):
     query: str = Field(min_length=1, max_length=2000, description="用户问题（1-2000字符）")
     conversation_id: str | None = None
     thread_id: str | None = None
+    tier: str = "pro"  # 检索档位：flash/fast/balanced/quality/pro/custom
+    custom_tier: dict | None = None  # tier=custom 时的自定义参数
 
 
 class ConversationCreate(BaseModel):
@@ -98,6 +106,13 @@ class ExcipientLookupRequest(BaseModel):
 # === 应用生命周期 ===
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 用户配置覆盖（API key / 检索参数）优先于 .env 默认值
+    try:
+        from settings_service import load_overrides
+        load_overrides()
+    except Exception as e:
+        print(f"[WARN] 加载用户配置覆盖失败: {e}", flush=True)
+
     # Redis 不可用时不应让整个后端崩溃（chat 流程并不依赖 Redis）
     try:
         await init_redis()
@@ -219,10 +234,17 @@ async def chat(http_request: Request, req: ChatRequest, user: str = Depends(requ
     async def event_generator():
         conversation_id = req.conversation_id or str(uuid.uuid4())
         thread_id = req.thread_id or str(uuid.uuid4())
+
+        # 检索档位解析：flash~pro 预设 / custom 自定义，请求级 ContextVar 隔离并发
+        from agent.tiers import resolve_tier
+        from agent.runtime_cfg import set_runtime, reset_runtime
+        tier_overrides = resolve_tier(req.tier, req.custom_tier)
+        rt_token = set_runtime(tier_overrides)
+
         config = {
             "configurable": {"thread_id": thread_id},
             # 调用期传入 recursion_limit，覆盖多轮回溯最坏路径，避免 GraphRecursionError
-            "recursion_limit": settings.max_retrieval_rounds * 6 + 12,
+            "recursion_limit": tier_overrides.get("max_retrieval_rounds", settings.max_retrieval_rounds) * 6 + 12,
         }
 
         # 1) 保存会话 + 用户消息到数据库
@@ -266,6 +288,12 @@ async def chat(http_request: Request, req: ChatRequest, user: str = Depends(requ
             "force_fallback": False,
             "cannot_answer": False,
             "low_confidence": False,
+            # --- 每轮请求级标志：必须重置，避免被上一轮(checkpoint)污染 ---
+            # 注意：entity_memory / session_summary / summary_rounds 是跨轮会话记忆，
+            # 必须随 checkpoint 在同一 thread_id 内持久化，绝不能在此重置（否则破坏实体记忆/摘要）。
+            "skip_retrieval": False,
+            "final_search_done": False,
+            "compressed_this_round": False,
             "final_answer": "",
             "thinking_steps": [],
             "expanded_queries": [],
@@ -339,6 +367,7 @@ async def chat(http_request: Request, req: ChatRequest, user: str = Depends(requ
             print(f"[ERROR] Chat API: {err_msg}\n{tb}", flush=True)
 
         finally:
+            reset_runtime(rt_token)
             yield "data: [DONE]\n\n"
             await asyncio.sleep(0)
 
@@ -423,6 +452,26 @@ async def delete_conversation(conversation_id: str, user: str = Depends(requires
     await db.execute(text("DELETE FROM conversations WHERE id=:id"), {"id": conversation_id})
     await db.commit()
     return {"status": "ok"}
+
+
+class RenameRequest(BaseModel):
+    title: str
+
+
+@app.put("/api/conversations/{conversation_id}")
+async def rename_conversation(
+    conversation_id: str, req: RenameRequest,
+    user: str = Depends(requires_auth), db: AsyncSession = Depends(get_db),
+):
+    """重命名 AI 问答会话标题。"""
+    title = (req.title or "").strip()[:80] or "未命名会话"
+    result = await db.execute(text(
+        "UPDATE conversations SET title=:title, updated_at=now() WHERE id=:id RETURNING id"
+    ), {"title": title, "id": conversation_id})
+    await db.commit()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return {"status": "ok", "title": title}
 
 
 # === 反馈 ===
@@ -563,6 +612,59 @@ async def delete_lookup_history(history_id: str, user: str = Depends(requires_au
     await db.execute(text("DELETE FROM lookup_history WHERE id=:id"), {"id": history_id})
     await db.commit()
     return {"status": "ok"}
+
+
+@app.put("/api/lookup/history/{history_id}")
+async def rename_lookup_history(
+    history_id: str, req: RenameRequest,
+    user: str = Depends(requires_auth), db: AsyncSession = Depends(get_db),
+):
+    """重命名速查历史记录。"""
+    title = (req.title or "").strip()[:80] or "未命名速查"
+    result = await db.execute(text(
+        "UPDATE lookup_history SET name=:title WHERE id=:id RETURNING id"
+    ), {"title": title, "id": history_id})
+    await db.commit()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    return {"status": "ok", "title": title}
+
+
+# === 设置管理（API 配置 / 检索参数） ===
+class SettingsUpdate(BaseModel):
+    deepseek_api_key: str | None = None
+    tavily_api_key: str | None = None
+    anysearch_api_key: str | None = None
+    retrieval: dict | None = None
+
+
+@app.get("/api/settings")
+async def get_settings_api(user: str = Depends(requires_auth)):
+    from settings_service import get_masked_api_keys, get_retrieval_params
+    return {
+        "api_keys": get_masked_api_keys(),
+        "retrieval": get_retrieval_params(),
+    }
+
+
+@app.put("/api/settings")
+async def update_settings_api(req: SettingsUpdate, user: str = Depends(requires_auth)):
+    from settings_service import save_api_keys, save_retrieval_params
+    api_payload = {
+        k: getattr(req, k)
+        for k in ("deepseek_api_key", "tavily_api_key", "anysearch_api_key")
+        if getattr(req, k) is not None
+    }
+    if api_payload:
+        save_api_keys(api_payload)
+    if req.retrieval:
+        save_retrieval_params(req.retrieval)
+    return await _settings_view()
+
+
+async def _settings_view():
+    from settings_service import get_masked_api_keys, get_retrieval_params
+    return {"api_keys": get_masked_api_keys(), "retrieval": get_retrieval_params()}
 
 
 # === 健康检查 ===

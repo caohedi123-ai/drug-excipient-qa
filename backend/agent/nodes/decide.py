@@ -2,6 +2,7 @@
 
 from agent.state import AgentState
 from config import get_settings
+from agent.runtime_cfg import get_param
 
 settings = get_settings()
 
@@ -24,7 +25,7 @@ def run_decide(state: AgentState) -> dict:
     failure_reasons = state.get("failure_reasons", [])
     thinking_steps = state.get("thinking_steps", [])
 
-    max_rounds = settings.max_retrieval_rounds
+    max_rounds = get_param("max_retrieval_rounds", settings.max_retrieval_rounds)
 
     retrieval_results = state.get("retrieval_results", [])
     any_success = any(r.get("success") for r in retrieval_results)

@@ -3,8 +3,9 @@ import { Sidebar } from './components/Sidebar'
 import { ChatContainer } from './components/ChatContainer'
 import { ExcipientLookup } from './components/ExcipientLookup'
 import LoginPage from './components/LoginPage'
+import SettingsModal from './components/SettingsModal'
 import { AuthProvider, useAuth } from './lib/AuthContext'
-import { fetchLookupHistory, fetchConversations } from './lib/api'
+import { fetchLookupHistory, fetchConversations, renameConversation, renameLookupHistory } from './lib/api'
 import { uuid } from './lib/uuid'
 import type { Conversation, LookupHistoryItem } from './types'
 import type { ExcipientLookupResult } from './lib/api'
@@ -20,6 +21,7 @@ function AppContent() {
   const [lookupHistory, setLookupHistory] = useState<LookupHistoryItem[]>([])
   const [lookupRefreshKey, setLookupRefreshKey] = useState(0)
   const [preloadedLookup, setPreloadedLookup] = useState<LookupHistoryItem | null>(null)
+  const [settingsOpen, setSettingsOpen] = useState(false)
   const activeConvRef = useRef<Conversation | undefined>(undefined)
   const [convsLoadedFromBackend, setConvsLoadedFromBackend] = useState(false)
 
@@ -79,6 +81,7 @@ function AppContent() {
 
   const handleSelectConversation = useCallback((id: string) => {
     setActiveId(id)
+    setMode('chat')   // 从速查板块点击历史问答 → 切回 AI 问答页
   }, [])
 
   const handleUpdateConversation = useCallback((conv: Conversation) => {
@@ -98,6 +101,20 @@ function AppContent() {
     setConversations(prev => prev.filter(c => c.id !== id))
     if (activeId === id) setActiveId(null)
   }, [activeId])
+
+  const handleRenameConversation = useCallback((id: string, title: string) => {
+    setConversations(prev => prev.map(c => c.id === id ? { ...c, title } : c))
+    renameConversation(id, title).catch(err => {
+      console.warn('重命名会话失败:', err)
+    })
+  }, [])
+
+  const handleRenameLookup = useCallback((id: string, title: string) => {
+    setLookupHistory(prev => prev.map(h => h.id === id ? { ...h, name: title } : h))
+    renameLookupHistory(id, title).catch(err => {
+      console.warn('重命名速查历史失败:', err)
+    })
+  }, [])
 
   const handleToggleSidebar = useCallback(() => {
     setSidebarOpen(prev => !prev)
@@ -144,9 +161,11 @@ function AppContent() {
         onNew={handleNewConversation}
         onSelect={handleSelectConversation}
         onDelete={handleDeleteConversation}
+        onRename={handleRenameConversation}
         onClose={() => setSidebarOpen(false)}
         lookupHistory={lookupHistory}
         onSelectLookup={handleSelectLookupHistory}
+        onRenameLookup={handleRenameLookup}
       />
       <div className="flex-1 flex flex-col min-w-0 min-h-0 overflow-hidden">
         <div className="flex items-center gap-0 px-4 h-10 border-b border-[#21262d] bg-[#0d1117]">
@@ -187,6 +206,16 @@ function AppContent() {
               速查
             </button>
           </div>
+          <button
+            onClick={() => setSettingsOpen(true)}
+            className="ml-auto p-1.5 rounded-md text-[#8b949e] hover:text-[#e6edf3] hover:bg-[#1c2128] transition-colors duration-100"
+            title="系统设置：API 密钥与检索配置"
+          >
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+              <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+            </svg>
+          </button>
         </div>
         <div className={mode === 'chat' ? 'flex-1 flex flex-col min-w-0 min-h-0' : 'hidden'}>
           <ChatContainer
@@ -202,6 +231,7 @@ function AppContent() {
           />
         </div>
       </div>
+      <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} />
     </div>
   )
 }
